@@ -1,68 +1,114 @@
+import os
+import tempfile
+import shutil
+
+import cv2
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import shutil
-import uuid
 
 app = FastAPI(
     title="ShuttleEye AI",
-    version="0.4.0"
+    version="0.5.0"
 )
 
-# Allow ShuttleEye PWA to communicate with backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.get("/")
 def home():
     return {
         "name": "ShuttleEye AI",
         "status": "online",
-        "version": "0.4.0"
+        "version": "0.5.0"
     }
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "healthy",
-        "service": "ShuttleEye AI Backend"
+        "status": "healthy"
     }
 
 
 @app.post("/analyze-video")
 async def analyze_video(video: UploadFile = File(...)):
 
-    # Create temporary folder
-    os.makedirs("uploads", exist_ok=True)
+    # Create temporary file
+    suffix = os.path.splitext(video.filename)[1]
 
-    # Generate unique filename
-    file_id = str(uuid.uuid4())
-    file_extension = os.path.splitext(video.filename)[1]
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix
+    ) as temp_file:
 
-    file_path = f"uploads/{file_id}{file_extension}"
+        shutil.copyfileobj(video.file, temp_file)
+        temp_path = temp_file.name
 
-    # Save uploaded video
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(video.file, buffer)
+    try:
 
-    # Placeholder for AI processing
-    result = {
-        "status": "success",
-        "message": "Video received successfully",
-        "filename": video.filename,
-        "shuttle_detected": False,
-        "landing_detected": False,
-        "decision": "PROCESSING"
-    }
+        # Open video
+        cap = cv2.VideoCapture(temp_path)
 
-    # Delete temporary file
-    if os.path.exists(file_path):
-        os.remove(file_path)
+        if not cap.isOpened():
+            return {
+                "status": "error",
+                "message": "Could not open video"
+            }
 
-    return result
+        # Extract video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        frame_count = int(
+            cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        )
+
+        width = int(
+            cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        )
+
+        height = int(
+            cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        )
+
+        duration = frame_count / fps if fps > 0 else 0
+
+        cap.release()
+
+        file_size = os.path.getsize(temp_path)
+
+        return {
+            "status": "success",
+            "message": "Video analyzed successfully",
+            "filename": video.filename,
+            "video_info": {
+                "fps": round(fps, 2),
+                "total_frames": frame_count,
+                "duration_seconds": round(duration, 2),
+                "resolution": {
+                    "width": width,
+                    "height": height
+                },
+                "file_size_mb": round(
+                    file_size / (1024 * 1024),
+                    2
+                )
+            },
+            "analysis": {
+                "shuttle_detection": "coming soon",
+                "court_detection": "coming soon",
+                "landing_detection": "coming soon",
+                "line_decision": "coming soon"
+            }
+        }
+
+    finally:
+
+        # Delete temporary video
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
