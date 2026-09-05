@@ -60,15 +60,21 @@ def detect_court(frame):
     detected_lines = []
 
     if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
+    for line in lines:
 
-            detected_lines.append({
-                "x1": int(x1 / scale),
-                "y1": int(y1 / scale),
-                "x2": int(x2 / scale),
-                "y2": int(y2 / scale)
-            })
+        values = np.array(line).flatten()
+
+        if len(values) < 4:
+            continue
+
+        x1, y1, x2, y2 = values[:4]
+
+        detected_lines.append({
+            "x1": int(x1 / scale),
+            "y1": int(y1 / scale),
+            "x2": int(x2 / scale),
+            "y2": int(y2 / scale)
+        })
 
     # Temporary court detection logic
     court_detected = len(detected_lines) >= 4
