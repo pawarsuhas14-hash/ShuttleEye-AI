@@ -1,71 +1,25 @@
-import os
-import tempfile
-import uuid
-from pathlib import Path
-
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 import cv2
 import numpy as np
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
-
-# --------------------------------------------------
-# APP CONFIGURATION
-# --------------------------------------------------
+import os
+import uuid
+import shutil
 
 app = FastAPI(
     title="ShuttleEye AI",
-    version="0.5.0",
-    description="AI-powered badminton shuttle detection and video analysis"
+    description="AI-powered badminton shuttle detection and video analysis",
+    version="0.6.0"
 )
 
-
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --------------------------------------------------
-# OUTPUT DIRECTORY
-# --------------------------------------------------
-
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-app.mount(
-    "/outputs",
-    StaticFiles(directory="outputs"),
-    name="outputs"
-)
-
-
-# --------------------------------------------------
-# HOME
-# --------------------------------------------------
 
 @app.get("/")
 def home():
     return {
-        "name": "ShuttleEye AI",
-        "version": "0.5.0",
-        "status": "running",
-        "message": "AI-powered badminton shuttle analysis API"
+        "message": "Welcome to ShuttleEye AI",
+        "status": "running"
     }
 
-
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -74,526 +28,235 @@ def health():
     }
 
 
-# --------------------------------------------------
-# FIND MOVING OBJECT CANDIDATES
-# --------------------------------------------------
+def detect_court(frame):
+    """
+    Detect badminton court lines and estimate outer court corners.
+    """
 
-def detect_motion_candidates(frame1, frame2):
+    height, width = frame.shape[:2]
 
-    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    # Resize for faster processing
+    scale = 0.5
+    small = cv2.resize(frame, (int(width * scale), int(height * scale)))
 
-    gray1 = cv2.GaussianBlur(gray1, (5, 5), 0)
-    gray2 = cv2.GaussianBlur(gray2, (5, 5), 0)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-    difference = cv2.absdiff(gray1, gray2)
+    # Reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    _, threshold = cv2.threshold(
-        difference,
-        25,
-        255,
-        cv2.THRESH_BINARY
+    # Detect edges
+    edges = cv2.Canny(blurred, 50, 150)
+
+    # Detect lines
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=80,
+        maxLineGap=20
     )
 
-    kernel = np.ones((3, 3), np.uint8)
+    detected_lines = []
 
-    threshold = cv2.dilate(
-        threshold,
-        kernel,
-        iterations=2
-    )
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
 
-    contours, _ = cv2.findContours(
-        threshold,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+            detected_lines.append({
+                "x1": int(x1 / scale),
+                "y1": int(y1 / scale),
+                "x2": int(x2 / scale),
+                "y2": int(y2 / scale)
+            })
 
-    candidates = []
+    # Temporary court detection logic
+    court_detected = len(detected_lines) >= 4
 
-    for contour in contours:
+    return {
+        "court_detected": court_detected,
+        "court_lines_detected": len(detected_lines),
+        "lines": detected_lines[:30]
+    }
 
-        area = cv2.contourArea(contour)
-
-        # Ignore very tiny noise and large moving objects
-        if area < 2 or area > 500:
-
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        # Shuttle candidates should usually be relatively compact
-        if w > 80 or h > 80:
-
-            continue
-
-        center_x = x + (w // 2)
-        center_y = y + (h // 2)
-
-        candidates.append({
-            "x": int(center_x),
-            "y": int(center_y),
-            "area": float(area),
-            "width": int(w),
-            "height": int(h)
-        })
-
-    return candidates
-
-
-# --------------------------------------------------
-# SELECT BEST SHUTTLE CANDIDATE
-# --------------------------------------------------
-
-def select_best_candidate(candidates, previous_point=None):
-
-    if not candidates:
-
-        return None
-
-    # First detected point
-    if previous_point is None:
-
-        # Prefer small compact object
-        candidates.sort(
-            key=lambda p: abs(p["width"] - p["height"]) + p["area"]
-        )
-
-        return candidates[0]
-
-    best_candidate = None
-    best_distance = float("inf")
-
-    for candidate in candidates:
-
-        distance = np.sqrt(
-            (candidate["x"] - previous_point["x"]) ** 2 +
-            (candidate["y"] - previous_point["y"]) ** 2
-        )
-
-        if distance < best_distance:
-
-            best_distance = distance
-            best_candidate = candidate
-
-    # Reject candidate if it suddenly jumps too far
-    if best_distance > 250:
-
-        return None
-
-    return best_candidate
-
-
-# --------------------------------------------------
-# DRAW TRAJECTORY
-# --------------------------------------------------
-
-def draw_trajectory(frame, trajectory):
-
-    if len(trajectory) < 2:
-
-        return
-
-    points = []
-
-    for point in trajectory:
-
-        points.append(
-            (int(point["x"]), int(point["y"]))
-        )
-
-    for i in range(1, len(points)):
-
-        cv2.line(
-            frame,
-            points[i - 1],
-            points[i],
-            (0, 255, 255),
-            2
-        )
-
-
-# --------------------------------------------------
-# ANALYZE VIDEO
-# --------------------------------------------------
 
 @app.post("/analyze-video")
 async def analyze_video(video: UploadFile = File(...)):
 
-    if not video.filename:
+    # Create unique filename
+    file_id = str(uuid.uuid4())
 
-        raise HTTPException(
+    input_path = f"/tmp/{file_id}_{video.filename}"
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(video.file, buffer)
+
+    cap = cv2.VideoCapture(input_path)
+
+    if not cap.isOpened():
+        return JSONResponse(
             status_code=400,
-            detail="No video file provided"
+            content={
+                "status": "error",
+                "message": "Could not open video"
+            }
         )
 
-    allowed_extensions = [
-        ".mp4",
-        ".mov",
-        ".avi",
-        ".mkv"
-    ]
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    file_extension = Path(video.filename).suffix.lower()
+    duration = 0
 
-    if file_extension not in allowed_extensions:
+    if fps > 0:
+        duration = total_frames / fps
 
-        raise HTTPException(
+    # Read first valid frame for court detection
+    success, first_frame = cap.read()
+
+    if not success:
+        cap.release()
+
+        return JSONResponse(
             status_code=400,
-            detail="Unsupported video format"
+            content={
+                "status": "error",
+                "message": "Could not read video frames"
+            }
         )
 
-    temp_input_path = None
+    # Detect court
+    court_analysis = detect_court(first_frame)
 
-    try:
+    # Reset video
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # ------------------------------------------
-        # SAVE UPLOADED VIDEO
-        # ------------------------------------------
+    motion_frames = 0
+    shuttle_candidates = []
+    trajectory = []
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=file_extension
-        ) as temp_file:
+    previous_gray = None
+    frame_number = 0
 
-            temp_input_path = temp_file.name
+    while True:
 
-            contents = await video.read()
-
-            temp_file.write(contents)
-
-        file_size_mb = round(
-            len(contents) / (1024 * 1024),
-            2
-        )
-
-
-        # ------------------------------------------
-        # OPEN VIDEO
-        # ------------------------------------------
-
-        cap = cv2.VideoCapture(temp_input_path)
-
-        if not cap.isOpened():
-
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to open video"
-            )
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        if fps <= 0:
-
-            fps = 30
-
-        total_frames = int(
-            cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        )
-
-        width = int(
-            cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        )
-
-        height = int(
-            cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        )
-
-        duration_seconds = round(
-            total_frames / fps,
-            2
-        )
-
-
-        # ------------------------------------------
-        # CREATE OUTPUT VIDEO
-        # ------------------------------------------
-
-        output_filename = (
-            f"shuttleeye_{uuid.uuid4().hex}.mp4"
-        )
-
-        output_path = OUTPUT_DIR / output_filename
-
-        fourcc = cv2.VideoWriter_fourcc(
-            *"mp4v"
-        )
-
-        writer = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            fps,
-            (width, height)
-        )
-
-
-        # ------------------------------------------
-        # READ FIRST FRAME
-        # ------------------------------------------
-
-        success, previous_frame = cap.read()
+        success, frame = cap.read()
 
         if not success:
+            break
 
-            raise HTTPException(
-                status_code=400,
-                detail="Could not read video"
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        if previous_gray is not None:
+
+            difference = cv2.absdiff(previous_gray, gray)
+
+            _, threshold = cv2.threshold(
+                difference,
+                30,
+                255,
+                cv2.THRESH_BINARY
             )
 
-
-        trajectory = []
-        all_candidate_points = []
-
-        previous_shuttle_point = None
-
-        frame_number = 1
-        frames_with_motion = 0
-
-
-        # Write first frame
-
-        cv2.putText(
-            previous_frame,
-            "ShuttleEye AI",
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2
-        )
-
-        writer.write(previous_frame)
-
-
-        # ------------------------------------------
-        # PROCESS VIDEO FRAMES
-        # ------------------------------------------
-
-        while True:
-
-            success, current_frame = cap.read()
-
-            if not success:
-
-                break
-
-            frame_number += 1
-
-            candidates = detect_motion_candidates(
-                previous_frame,
-                current_frame
+            contours, _ = cv2.findContours(
+                threshold,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
             )
 
-            if candidates:
+            frame_has_motion = False
 
-                frames_with_motion += 1
+            for contour in contours:
 
+                area = cv2.contourArea(contour)
 
-            # Draw all candidate points
+                # Filter very small and very large movement
+                if 5 < area < 500:
 
-            for candidate in candidates:
+                    x, y, w, h = cv2.boundingRect(contour)
 
-                x = candidate["x"]
-                y = candidate["y"]
+                    center_x = x + w // 2
+                    center_y = y + h // 2
 
-                cv2.circle(
-                    current_frame,
-                    (x, y),
-                    4,
-                    (0, 255, 0),
-                    -1
-                )
+                    shuttle_candidates.append({
+                        "frame": frame_number,
+                        "x": center_x,
+                        "y": center_y,
+                        "area": float(area)
+                    })
 
+                    trajectory.append({
+                        "frame": frame_number,
+                        "x": center_x,
+                        "y": center_y
+                    })
 
-            # Select probable shuttle
+                    frame_has_motion = True
 
-            best_candidate = select_best_candidate(
-                candidates,
-                previous_shuttle_point
-            )
+            if frame_has_motion:
+                motion_frames += 1
 
+        previous_gray = gray
 
-            if best_candidate:
+        frame_number += 1
 
-                shuttle_point = {
-                    "frame": frame_number,
-                    "x": best_candidate["x"],
-                    "y": best_candidate["y"]
-                }
+    cap.release()
 
-                trajectory.append(shuttle_point)
+    motion_percentage = 0
 
-                all_candidate_points.append(
-                    shuttle_point
-                )
+    if total_frames > 0:
+        motion_percentage = (
+            motion_frames / total_frames
+        ) * 100
 
-                previous_shuttle_point = best_candidate
+    shuttle_detected = len(shuttle_candidates) > 5
 
+    estimated_landing_point = None
 
-                # Red circle around probable shuttle
+    if len(trajectory) > 0:
 
-                cv2.circle(
-                    current_frame,
-                    (
-                        best_candidate["x"],
-                        best_candidate["y"]
-                    ),
-                    10,
-                    (0, 0, 255),
-                    2
-                )
+        last_point = trajectory[-1]
 
-                cv2.putText(
-                    current_frame,
-                    "SHUTTLE",
-                    (
-                        best_candidate["x"] + 10,
-                        best_candidate["y"] - 10
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 255),
-                    2
-                )
-
-
-            # Draw trajectory
-
-            draw_trajectory(
-                current_frame,
-                trajectory
-            )
-
-
-            # Header information
-
-            cv2.putText(
-                current_frame,
-                "ShuttleEye AI",
-                (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2
-            )
-
-            cv2.putText(
-                current_frame,
-                f"Frame: {frame_number}",
-                (30, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-            cv2.putText(
-                current_frame,
-                f"Trajectory points: {len(trajectory)}",
-                (30, 125),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-
-            writer.write(current_frame)
-
-            previous_frame = current_frame.copy()
-
-
-        # ------------------------------------------
-        # MARK ESTIMATED LANDING POINT
-        # ------------------------------------------
-
-        estimated_landing_point = None
-
-        if trajectory:
-
-            estimated_landing_point = trajectory[-1]
-
-
-        # ------------------------------------------
-        # CLEANUP
-        # ------------------------------------------
-
-        cap.release()
-        writer.release()
-
-
-        # ------------------------------------------
-        # RESPONSE
-        # ------------------------------------------
-
-        return {
-            "status": "success",
-            "message": "Video analyzed successfully",
-
-            "filename": video.filename,
-
-            "video_info": {
-                "fps": round(fps, 2),
-                "total_frames": total_frames,
-                "duration_seconds": duration_seconds,
-
-                "resolution": {
-                    "width": width,
-                    "height": height
-                },
-
-                "file_size_mb": file_size_mb
-            },
-
-            "motion_analysis": {
-                "frames_with_motion": frames_with_motion,
-
-                "motion_percentage": round(
-                    (frames_with_motion / total_frames) * 100,
-                    2
-                ) if total_frames > 0 else 0
-            },
-
-            "shuttle_detection": {
-
-                "shuttle_detected": (
-                    len(trajectory) > 0
-                ),
-
-                "candidate_points": len(
-                    all_candidate_points
-                ),
-
-                "trajectory_points": trajectory,
-
-                "estimated_landing_point":
-                    estimated_landing_point
-            },
-
-            "annotated_video": {
-                "filename": output_filename,
-                "url": f"/outputs/{output_filename}"
-            }
+        estimated_landing_point = {
+            "frame": last_point["frame"],
+            "x": last_point["x"],
+            "y": last_point["y"]
         }
 
+    # Clean temporary file
+    if os.path.exists(input_path):
+        os.remove(input_path)
 
-    except HTTPException:
+    return {
+        "status": "success",
+        "message": "Video analyzed successfully",
 
-        raise
+        "video_info": {
+            "fps": fps,
+            "total_frames": total_frames,
+            "duration_seconds": round(duration, 2),
+            "resolution": {
+                "width": width,
+                "height": height
+            }
+        },
 
+        "motion_analysis": {
+            "frames_with_motion": motion_frames,
+            "motion_percentage": round(motion_percentage, 2)
+        },
 
-    except Exception as error:
+        "court_analysis": court_analysis,
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(error)
-        )
+        "shuttle_detection": {
+            "shuttle_detected": shuttle_detected,
+            "candidate_points": len(shuttle_candidates)
+        },
 
+        "trajectory": trajectory[-100:],
 
-    finally:
-
-        if temp_input_path and os.path.exists(
-            temp_input_path
-        ):
-
-            os.remove(temp_input_path)
+        "estimated_landing_point": estimated_landing_point
+    }
