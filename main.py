@@ -60,10 +60,9 @@ def detect_court(frame):
 detected_lines = []
 
 if lines is not None:
-     for line in lines:
+    for line in lines:
         values = np.array(line).flatten()
-
-         if len(values) < 4:
+        if len(values) < 4:
             continue
 
         x1, y1, x2, y2 = values[:4]
