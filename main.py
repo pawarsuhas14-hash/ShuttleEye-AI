@@ -56,7 +56,7 @@ def detect_court(frame):
         minLineLength=80,
         maxLineGap=20
     )
-
+    
 detected_lines = []
 
 if lines is not None:
@@ -72,7 +72,7 @@ if lines is not None:
                 "x2": int(x2 / scale),
                 "y2": int(y2 / scale),
             }
-        )
+         )
         
 # Temporary court detection logic
     court_detected = len(detected_lines) >= 4
