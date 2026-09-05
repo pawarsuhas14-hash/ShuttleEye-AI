@@ -58,6 +58,7 @@ def detect_court(frame):
     )
     
 detected_lines = []
+
 if lines is not None:
     for line in lines:
         values = np.array(line).flatten()
