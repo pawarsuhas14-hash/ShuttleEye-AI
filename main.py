@@ -61,8 +61,19 @@ def detect_court(frame):
 
     if lines is not None:
     for line in lines:
-    line = line.flatten()
-    x1, y1, x2, y2 = line
+        values = np.array(line).flatten()
+
+        if len(values) < 4:
+            continue
+
+        x1, y1, x2, y2 = values[:4]
+
+        detected_lines.append({
+            "x1": int(x1 / scale),
+            "y1": int(y1 / scale),
+            "x2": int(x2 / scale),
+            "y2": int(y2 / scale)
+        })
 
         values = np.array(line).flatten()
 
