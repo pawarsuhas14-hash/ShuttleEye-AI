@@ -57,9 +57,9 @@ def detect_court(frame):
         maxLineGap=20
     )
 
-    detected_lines = []
+detected_lines = []
 
-    if lines is not None:
+if lines is not None:
     for line in lines:
         values = np.array(line).flatten()
 
@@ -74,9 +74,7 @@ def detect_court(frame):
             "x2": int(x2 / scale),
             "y2": int(y2 / scale)
         })
-
-        values = np.array(line).flatten()
-
+        
         if len(values) < 4:
             continue
 
