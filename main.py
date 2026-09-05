@@ -60,7 +60,6 @@ def detect_court(frame):
 detected_lines = []
 
 if lines is not None:
-    pass
     for line in lines:
         values = np.array(line).flatten()
         if len(values) < 4:
@@ -74,7 +73,6 @@ if lines is not None:
                 "y2": int(y2 / scale),
             }
         )
-
 # Temporary court detection logic
     court_detected = len(detected_lines) >= 4
 
