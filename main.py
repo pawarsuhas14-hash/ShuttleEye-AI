@@ -5,6 +5,9 @@ import numpy as np
 import os
 import uuid
 import shutil
+from court_detector import detect_court_lines
+from court_corners import get_court_corners
+from calibration import calculate_perspective_transform
 
 app = FastAPI(
     title="ShuttleEye AI",
