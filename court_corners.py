@@ -1,202 +1,200 @@
 import numpy as np
+import cv2
+
 
 def line_intersection(line1, line2):
-    """
-    Calculate the intersection point between two detected lines.
+x1, y1, x2, y2 = (
+line1["x1"],
+line1["y1"],
+line1["x2"],
+line1["y2"]
+)
 
-    Each line is represented as a dictionary:
-    {
-        "x1": x1,
-        "y1": y1,
-        "x2": x2,
-        "y2": y2
-    }
+x3, y3, x4, y4 = (
+line2["x1"],
+line2["y1"],
+line2["x2"],
+line2["y2"]
+)
 
-    Returns:
-        (x, y) intersection point
-        or None if lines are parallel.
-    """
+denominator = (
+(x1 - x2) * (y3 - y4)
+- (y1 - y2) * (x3 - x4)
+)
 
-    x1 = line1["x1"]
-    y1 = line1["y1"]
-    x2 = line1["x2"]
-    y2 = line1["y2"]
+if abs(denominator) < 0.001:
+return None
 
-    x3 = line2["x1"]
-    y3 = line2["y1"]
-    x4 = line2["x2"]
-    y4 = line2["y2"]
+px = (
+((x1 * y2 - y1 * x2) * (x3 - x4)
+- (x1 - x2) * (x3 * y4 - y3 * x4))
+/ denominator
+)
 
-    denominator = (
-        (x1 - x2) * (y3 - y4)
-        - (y1 - y2) * (x3 - x4)
-    )
+py = (
+((x1 * y2 - y1 * x2) * (y3 - y4)
+- (y1 - y2) * (x3 * y4 - y3 * x4))
+/ denominator
+)
 
-    if denominator == 0:
-        return None
+return int(px), int(py)
 
-    px = (
-        ((x1 * y2 - y1 * x2) * (x3 - x4)
-        - (x1 - x2) * (x3 * y4 - y3 * x4))
-        / denominator
-    )
-
-    py = (
-        ((x1 * y2 - y1 * x2) * (y3 - y4)
-        - (y1 - y2) * (x3 * y4 - y3 * x4))
-        / denominator
-    )
-
-    return int(px), int(py)
-
-
-def find_line_intersections(lines):
-    """
-    Find all possible intersection points
-    between detected court lines.
-
-    Args:
-lines: List of detected line dictionaries:
-       {
-           "x1": int,
-           "y1": int,
-           "x2": int,
-           "y2": int
-       }
-
-    Returns:
-        List of intersection points.
-    """
-
-    intersections = []
-
-    if lines is None:
-        return intersections
-
-    for i in range(len(lines)):
-        for j in range(i + 1, len(lines)):
-
-            point = line_intersection(
-                lines[i],
-                lines[j]
-            )
-
-            if point is not None:
-                intersections.append(point)
-
-    return intersections
-
-
-def filter_points_inside_frame(points, frame_shape):
-    """
-    Remove intersection points outside
-    the video frame.
-
-    Args:
-        points: List of (x, y) points
-        frame_shape: Video frame shape
-
-    Returns:
-        Valid points inside the frame.
-    """
-
-    height, width = frame_shape[:2]
-
-    valid_points = []
-
-    for x, y in points:
-
-        if 0 <= x < width and 0 <= y < height:
-            valid_points.append((x, y))
-
-    return valid_points
 
 def get_court_corners(frame):
-    """
-    Detect badminton court corners from a video frame.
 
-    Returns:
-        Dictionary containing detected court corner points
-        or None if detection fails.
-    """
+if frame is None:
+return None
 
-    try:
-        import cv2
-        import numpy as np
+try:
 
-        if frame is None:
-            return None
+height, width = frame.shape[:2]
 
-        # Convert frame to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+gray = cv2.cvtColor(
+frame,
+cv2.COLOR_BGR2GRAY
+)
 
-        # Slight blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+blurred = cv2.GaussianBlur(
+gray,
+(5, 5),
+0
+)
 
-        # Edge detection
-        edges = cv2.Canny(
-            blurred,
-            50,
-            150,
-            apertureSize=3
-        )
+edges = cv2.Canny(
+blurred,
+50,
+150
+)
 
-        # Detect lines
-        lines_p = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=80,
-            minLineLength=80,
-            maxLineGap=20
-        )
+lines_p = cv2.HoughLinesP(
+edges,
+rho=1,
+theta=np.pi / 180,
+threshold=100,
+minLineLength=100,
+maxLineGap=30
+)
 
-        if lines_p is None:
-            return None
+if lines_p is None:
+return None
 
-        lines = []
+lines = []
 
-        for line in lines_p:
-            x1, y1, x2, y2 = line[0]
+for line in lines_p:
 
-            lines.append({
-                "x1": int(x1),
-                "y1": int(y1),
-                "x2": int(x2),
-                "y2": int(y2)
-            })
+x1, y1, x2, y2 = line[0]
 
-        # Find intersections
-        intersections = find_line_intersections(lines)
+lines.append(
+{
+"x1": int(x1),
+"y1": int(y1),
+"x2": int(x2),
+"y2": int(y2)
+}
+)
 
-        # Keep points inside frame
-        valid_points = filter_points_inside_frame(
-            intersections,
-            frame.shape
-        )
+intersections = []
 
-        if len(valid_points) < 4:
-            return None
+for i in range(len(lines)):
 
-        # Convert to numpy array
-        points = np.array(valid_points, dtype=np.float32)
+for j in range(i + 1, len(lines)):
 
-        # Find bounding rectangle
-        x, y, w, h = cv2.boundingRect(points)
+point = line_intersection(
+lines[i],
+lines[j]
+)
 
-        top_left = (int(x), int(y))
-        top_right = (int(x + w), int(y))
-        bottom_right = (int(x + w), int(y + h))
-        bottom_left = (int(x), int(y + h))
+if point is None:
+continue
 
-        return {
-            "top_left": top_left,
-            "top_right": top_right,
-            "bottom_right": bottom_right,
-            "bottom_left": bottom_left,
-            "all_points": valid_points
-        }
+x, y = point
 
-    except Exception as e:
-        print(f"Court corner detection error: {e}")
-        return None
+if (
+0 <= x < width
+and 0 <= y < height
+):
+intersections.append(point)
+
+if len(intersections) < 4:
+return None
+
+points = np.array(
+intersections,
+dtype=np.float32
+)
+
+# Convex hull finds outer boundary
+hull = cv2.convexHull(points)
+
+if len(hull) < 4:
+return None
+
+# Approximate polygon
+epsilon = 0.02 * cv2.arcLength(
+hull,
+True
+)
+
+approx = cv2.approxPolyDP(
+hull,
+epsilon,
+True
+)
+
+points = approx.reshape(-1, 2)
+
+if len(points) < 4:
+
+# Fallback bounding rectangle
+x, y, w, h = cv2.boundingRect(hull)
+
+return {
+"top_left": (x, y),
+"top_right": (x + w, y),
+"bottom_right": (x + w, y + h),
+"bottom_left": (x, y + h)
+}
+
+# If more than 4 points, use bounding rectangle
+if len(points) != 4:
+
+x, y, w, h = cv2.boundingRect(points)
+
+points = np.array([
+[x, y],
+[x + w, y],
+[x + w, y + h],
+[x, y + h]
+])
+
+# Sort corners
+points = points.astype(np.int32)
+
+sorted_by_y = points[np.argsort(points[:, 1])]
+
+top = sorted_by_y[:2]
+bottom = sorted_by_y[2:]
+
+top = top[np.argsort(top[:, 0])]
+bottom = bottom[np.argsort(bottom[:, 0])]
+
+top_left = tuple(top[0])
+top_right = tuple(top[1])
+
+bottom_left = tuple(bottom[0])
+bottom_right = tuple(bottom[1])
+
+return {
+"top_left": top_left,
+"top_right": top_right,
+"bottom_right": bottom_right,
+"bottom_left": bottom_left
+}
+
+except Exception as e:
+
+print(
+f"Court corner detection error: {e}"
+)
+
+return None
