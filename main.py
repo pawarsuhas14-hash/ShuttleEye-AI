@@ -195,13 +195,13 @@ async def analyze_video(video: UploadFile = File(...)):
         )
 
 # Detect court lines
-court_analysis = detect_court(first_frame)
+    court_analysis = detect_court(first_frame)
 
 # Detect actual court corners
-court_corners = get_court_corners(first_frame)
+    court_corners = get_court_corners(first_frame)
 
 # Add corners to court analysis
-court_analysis["corners"] = court_corners
+    court_analysis["corners"] = court_corners
 
     # Reset video
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
