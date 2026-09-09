@@ -84,6 +84,69 @@ def detect_court(frame):
         "lines": detected_lines[:30]
     }
 
+def check_landing_inside_court(
+landing_point,
+court_corners
+):
+"""
+Check whether shuttle landing point
+is inside or outside the detected court.
+"""
+
+if landing_point is None:
+return {
+"result": "UNKNOWN",
+"reason": "Landing point not detected"
+}
+
+if court_corners is None:
+return {
+"result": "UNKNOWN",
+"reason": "Court corners not detected"
+}
+
+try:
+
+court_polygon = np.array([
+court_corners["top_left"],
+court_corners["top_right"],
+court_corners["bottom_right"],
+court_corners["bottom_left"]
+], dtype=np.int32)
+
+point = (
+float(landing_point["x"]),
+float(landing_point["y"])
+)
+
+result = cv2.pointPolygonTest(
+court_polygon,
+point,
+False
+)
+
+if result >= 0:
+
+return {
+"result": "IN",
+"inside": True,
+"message": "Shuttle landed inside court"
+}
+
+else:
+
+return {
+"result": "OUT",
+"inside": False,
+"message": "Shuttle landed outside court"
+}
+
+except Exception as e:
+
+return {
+"result": "UNKNOWN",
+"reason": str(e)
+}
 
 @app.post("/analyze-video")
 async def analyze_video(video: UploadFile = File(...)):
@@ -131,8 +194,14 @@ async def analyze_video(video: UploadFile = File(...)):
             }
         )
 
-    # Detect court
-    court_analysis = detect_court(first_frame)
+# Detect court lines
+court_analysis = detect_court(first_frame)
+
+# Detect actual court corners
+court_corners = get_court_corners(first_frame)
+
+# Add corners to court analysis
+court_analysis["corners"] = court_corners
 
     # Reset video
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -219,17 +288,25 @@ async def analyze_video(video: UploadFile = File(...)):
 
     shuttle_detected = len(shuttle_candidates) > 5
 
-    estimated_landing_point = None
+estimated_landing_point = None
 
-    if len(trajectory) > 0:
+if len(trajectory) > 0:
 
-        last_point = trajectory[-1]
+last_point = trajectory[-1]
 
-        estimated_landing_point = {
-            "frame": last_point["frame"],
-            "x": last_point["x"],
-            "y": last_point["y"]
-        }
+estimated_landing_point = {
+"frame": last_point["frame"],
+"x": last_point["x"],
+"y": last_point["y"]
+}
+
+
+# Determine whether landing point is IN or OUT
+
+landing_decision = check_landing_inside_court(
+estimated_landing_point,
+court_corners
+)
 
     # Clean temporary file
     if os.path.exists(input_path):
@@ -264,4 +341,6 @@ async def analyze_video(video: UploadFile = File(...)):
         "trajectory": trajectory[-100:],
 
         "estimated_landing_point": estimated_landing_point
+
+        "decision": landing_decision
     }
