@@ -499,7 +499,7 @@ def get_court_corners(frame):
                 continue
 
             for raw in lines_p:
-                x1, y1, x2, y2 = raw[0]
+                x1, y1, x2, y2 = np.asarray(raw).reshape(-1)[:4]
 
                 all_lines.append({
                     "x1": int(x1),
