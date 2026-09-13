@@ -69,7 +69,7 @@ def detect_court(frame):
 
     if lines is not None:
         for raw in lines:
-            x1, y1, x2, y2 = raw[0]
+            x1, y1, x2, y2 = np.asarray(raw).reshape(-1)[:4]
             length = float(np.hypot(x2 - x1, y2 - y1))
 
             if length < min_len:
