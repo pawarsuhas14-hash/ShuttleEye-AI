@@ -118,12 +118,22 @@ def check_landing_inside_court(landing_point, court_corners, margin=0):
         }
 
     try:
-        polygon = np.array([
-            court_corners["top_left"],
-            court_corners["top_right"],
-            court_corners["bottom_right"],
-            court_corners["bottom_left"]
-        ], dtype=np.float32)
+        # Accept both the current named-corner dictionary and the older
+        # four-point list format. This prevents a geometry-format mismatch
+        # from turning a valid shuttle detection into UNKNOWN.
+        if isinstance(court_corners, dict):
+            polygon_points = [
+                court_corners["top_left"],
+                court_corners["top_right"],
+                court_corners["bottom_right"],
+                court_corners["bottom_left"]
+            ]
+        elif isinstance(court_corners, (list, tuple)) and len(court_corners) == 4:
+            polygon_points = list(court_corners)
+        else:
+            raise ValueError("Unsupported court corner format")
+
+        polygon = np.array(polygon_points, dtype=np.float32)
 
         point = (
             float(landing_point["x"]),
