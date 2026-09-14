@@ -6,6 +6,7 @@ import numpy as np
 import os
 import uuid
 import shutil
+import time
 import math
 
 
@@ -521,17 +522,49 @@ def choose_landing_point(trajectory, fps):
     }
 
 
+
+MAX_ANALYSIS_FRAMES = 90
+MAX_UPLOAD_BYTES = 80 * 1024 * 1024  # 80 MB
+
+
+def compact_trajectory(points, max_points=20):
+    """Return a small, JSON-friendly trajectory for the API response."""
+    if not points:
+        return []
+    if len(points) <= max_points:
+        return points
+    idx = np.linspace(0, len(points) - 1, max_points).astype(int)
+    return [points[int(i)] for i in idx]
+
+
+@app.post("/analyze-video")
 @app.post("/analyze-video")
 async def analyze_video(video: UploadFile = File(...)):
     input_path = None
+    started = time.time()
 
     try:
         file_id = str(uuid.uuid4())
         safe_filename = os.path.basename(video.filename or "video.mp4")
         input_path = f"/tmp/{file_id}_{safe_filename}"
 
+        # Stream the upload to disk with a hard size limit.
+        total_bytes = 0
         with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
+            while True:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "status": "error",
+                            "message": "Video is too large. Maximum supported upload is 80 MB."
+                        }
+                    )
+                buffer.write(chunk)
 
         cap = cv2.VideoCapture(input_path)
 
@@ -548,10 +581,10 @@ async def analyze_video(video: UploadFile = File(...)):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = total_frames / fps if fps > 0 else 0
+        duration = total_frames / fps if fps > 0 else 0.0
 
+        # Read the first valid frame for court detection.
         success, first_frame = cap.read()
-
         if not success:
             cap.release()
             return JSONResponse(
@@ -566,20 +599,28 @@ async def analyze_video(video: UploadFile = File(...)):
         court_corners = get_court_corners(first_frame)
         court_analysis["corners"] = court_corners
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Sample frames instead of processing every frame. This is much
+        # friendlier to Render's free instance while retaining the motion path.
+        if total_frames <= MAX_ANALYSIS_FRAMES:
+            sample_frames = list(range(total_frames))
+        else:
+            sample_frames = np.linspace(
+                0, total_frames - 1, MAX_ANALYSIS_FRAMES
+            ).astype(int).tolist()
 
+        # Keep the list indexed by the original video frame number because
+        # track_shuttle() uses frame numbers for gap/velocity calculations.
+        frame_candidates_by_frame = [[] for _ in range(total_frames)]
+        previous_gray = None
         motion_frames = 0
         raw_candidate_count = 0
-        frame_candidates_by_frame = []
+        processed_frames = 0
 
-        previous_gray = None
-        frame_number = 0
-
-        while True:
+        for frame_index in sample_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
             success, frame = cap.read()
-
             if not success:
-                break
+                continue
 
             current_gray, candidates = extract_frame_candidates(
                 frame,
@@ -590,15 +631,16 @@ async def analyze_video(video: UploadFile = File(...)):
                 motion_frames += 1
                 raw_candidate_count += len(candidates)
 
-            frame_candidates_by_frame.append(candidates)
+            frame_candidates_by_frame[int(frame_index)] = candidates
             previous_gray = current_gray
-            frame_number += 1
+            processed_frames += 1
 
         cap.release()
 
+        # track_shuttle historically accepts (frame_no, candidates) pairs.
         trajectory, tracking_confidence = track_shuttle(
             frame_candidates_by_frame,
-            frame_number
+            total_frames
         )
 
         shuttle_detected = len(trajectory) >= 3
@@ -614,21 +656,26 @@ async def analyze_video(video: UploadFile = File(...)):
         )
 
         motion_percentage = (
-            motion_frames / total_frames * 100.0
-            if total_frames > 0 else 0.0
+            motion_frames / processed_frames * 100.0
+            if processed_frames > 0 else 0.0
         )
 
-        # Overall confidence is deliberately conservative.
         overall_confidence = (
             tracking_confidence
             if court_corners is not None
             else tracking_confidence * 0.65
         )
 
+        elapsed = round(time.time() - started, 2)
+
+        # Compact response: do not send the full trajectory or dozens of
+        # Hough lines back to the browser.
         return {
             "status": "success",
             "message": "Video analyzed successfully",
+            "processing_seconds": elapsed,
             "video_info": {
+                "filename": safe_filename,
                 "fps": round(fps, 3),
                 "total_frames": total_frames,
                 "duration_seconds": round(duration, 2),
@@ -637,23 +684,28 @@ async def analyze_video(video: UploadFile = File(...)):
                     "height": height
                 }
             },
-            "motion_analysis": {
-                "frames_with_motion": motion_frames,
+            "analysis": {
+                "processed_frames": processed_frames,
+                "motion_frames": motion_frames,
                 "motion_percentage": round(motion_percentage, 2)
             },
-            "court_analysis": court_analysis,
-            "shuttle_detection": {
-                "shuttle_detected": shuttle_detected,
-                "candidate_points": raw_candidate_count,
-                "tracked_points": len(trajectory),
-                "tracking_confidence": round(tracking_confidence, 3)
+            "court": {
+                "detected": bool(court_analysis.get("court_detected")),
+                "lines_detected": int(court_analysis.get("court_lines_detected", 0)),
+                "corners_detected": court_corners is not None
             },
-            "trajectory": trajectory[-100:],
-            "estimated_landing_point": estimated_landing_point,
+            "shuttle": {
+                "detected": bool(shuttle_detected),
+                "candidate_points": int(raw_candidate_count),
+                "tracked_points": int(len(trajectory)),
+                "tracking_confidence": round(float(tracking_confidence), 3)
+            },
+            "landing": estimated_landing_point,
             "decision": {
                 **landing_decision,
-                "confidence": round(overall_confidence, 3)
-            }
+                "confidence": round(float(overall_confidence), 3)
+            },
+            "trajectory": compact_trajectory(trajectory, 20)
         }
 
     except Exception as e:
