@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
 
 
@@ -241,6 +241,7 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
     )
     appearance = cv2.bitwise_or(white_mask, yellow_mask)
 
+    # Primary detector: motion + shuttle appearance.
     combined = cv2.bitwise_and(motion, appearance)
 
     contours, _ = cv2.findContours(
@@ -251,7 +252,7 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
 
     candidates = []
 
-    def collect(contour_list, motion_only=False):
+    def collect(contour_list, motion_only=False, appearance_only=False):
         for contour in contour_list:
             area = float(cv2.contourArea(contour))
             if not (1.5 <= area <= 450.0):
@@ -265,9 +266,17 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
                 gray, hsv, contour, x, y, w, h, area
             )
 
-            if motion_only and score < 0.30:
+            if motion_only and score < 0.24:
                 continue
-            if not motion_only and appearance_ratio < 0.08:
+            if appearance_only:
+                # Appearance-only candidates are mainly used for the yellow
+                # shuttle when motion blur makes frame differencing fail.
+                # Require a meaningful yellow fraction and a compact blob.
+                if yellow_ratio < 0.10:
+                    continue
+                if area < 2.0 or area > 700.0:
+                    continue
+            elif not motion_only and appearance_ratio < 0.05:
                 continue
 
             candidates.append({
@@ -284,7 +293,7 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
 
     collect(contours, motion_only=False)
 
-    # Fallback: motion-only blobs are useful when the shuttle is blurred.
+    # Fallback 1: motion-only blobs are useful when the shuttle is blurred.
     if not candidates:
         motion_contours, _ = cv2.findContours(
             motion,
@@ -292,6 +301,16 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
             cv2.CHAIN_APPROX_SIMPLE,
         )
         collect(motion_contours, motion_only=True)
+
+    # Fallback 2: detect compact yellow shuttle blobs even when the frame
+    # difference is too weak. This is important for high-speed shuttle motion.
+    if not candidates:
+        yellow_contours, _ = cv2.findContours(
+            yellow_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        collect(yellow_contours, appearance_only=True)
 
     candidates.sort(
         key=lambda c: (
@@ -311,7 +330,7 @@ def _transition_score(previous, current, previous_previous=None, frame_gap=1):
     distance = math.hypot(dx, dy)
 
     # Perspective and fast shuttle motion can create large frame-to-frame jumps.
-    max_jump = 430.0 * max(1, frame_gap)
+    max_jump = 700.0 * max(1, frame_gap)
     if distance > max_jump:
         return -1e9
 
@@ -360,7 +379,7 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
         if not candidates:
             misses += 1
-            if misses > 5:
+            if misses > 8:
                 break
             frame_no += step
             continue
@@ -382,7 +401,7 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
         if best is None or best_score < -0.70:
             misses += 1
-            if misses > 3:
+            if misses > 5:
                 break
             frame_no += step
             continue
@@ -457,10 +476,10 @@ def track_shuttle(frame_candidates_by_frame):
                 gap = max(1, b["frame"] - a["frame"])
                 jumps.append(
                     math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-                    / (430.0 * gap)
+                    / (700.0 * gap)
                 )
             smoothness = 1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0)))
-            length_score = min(1.0, len(path) / 14.0)
+            length_score = min(1.0, len(path) / 10.0)
             quality = (
                 0.45 * smoothness
                 + 0.40 * length_score
@@ -479,14 +498,14 @@ def track_shuttle(frame_candidates_by_frame):
         gap = max(1, b["frame"] - a["frame"])
         jumps.append(
             math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-            / (430.0 * gap)
+            / (700.0 * gap)
         )
 
     smoothness = max(
         0.0,
         1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0))),
     )
-    length_score = min(1.0, len(best_path) / 14.0)
+    length_score = min(1.0, len(best_path) / 10.0)
     confidence = 0.50 * smoothness + 0.50 * length_score
 
     return best_path, float(confidence)
