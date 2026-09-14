@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.1.0",
+    version="1.3.0",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.1.0",
+        "version": "1.3.0",
     }
 
 
@@ -262,6 +262,9 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
             if w < 2 or h < 2 or w > 70 or h > 70:
                 continue
 
+            roi_motion = motion[y:y + h, x:x + w]
+            motion_ratio = float(np.mean(roi_motion > 0)) if roi_motion.size else 0.0
+
             score, appearance_ratio, yellow_ratio, circularity = _candidate_score(
                 gray, hsv, contour, x, y, w, h, area
             )
@@ -269,10 +272,12 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
             if motion_only and score < 0.24:
                 continue
             if appearance_only:
-                # Appearance-only candidates are mainly used for the yellow
-                # shuttle when motion blur makes frame differencing fail.
-                # Require a meaningful yellow fraction and a compact blob.
+                # Do not accept a stationary yellow object as the shuttle.
+                # The yellow fallback is allowed only when there is measurable
+                # temporal motion inside the blob.
                 if yellow_ratio < 0.10:
+                    continue
+                if motion_ratio < 0.015:
                     continue
                 if area < 2.0 or area > 700.0:
                     continue
@@ -286,6 +291,7 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None):
                 "w": int(round(w / scale)),
                 "h": int(round(h / scale)),
                 "score": round(score, 4),
+                "motion_ratio": round(motion_ratio, 4),
                 "appearance_ratio": round(appearance_ratio, 4),
                 "yellow_ratio": round(yellow_ratio, 4),
                 "circularity": round(circularity, 4),
@@ -337,10 +343,32 @@ def _transition_score(previous, current, previous_previous=None, frame_gap=1):
     score = -1.05 * (distance / max_jump)
     score += 1.8 * current["score"]
 
+    # A line/fixture or other yellow object can remain in almost the same
+    # place for hundreds of frames. Penalize zero-motion transitions so the
+    # tracker cannot turn a static object into a fake shuttle trajectory.
+    if distance < 3.0:
+        score -= 0.55
+    elif distance < 8.0:
+        score -= 0.10
+
+    # Prefer candidates that actually overlap temporal motion.
+    score += 0.55 * current.get("motion_ratio", 0.0)
+
     if previous_previous is not None:
         pdx = previous["x"] - previous_previous["x"]
         pdy = previous["y"] - previous_previous["y"]
         previous_distance = math.hypot(pdx, pdy)
+
+        # Do not bridge a missing frame from a stationary false positive to
+        # a distant court line/object. A real shuttle should continue moving
+        # or remain very close when a single frame is missed.
+        if frame_gap > 1 and previous_distance < 15.0 and distance > 80.0:
+            return -1e9
+
+        # Reject implausible teleportation from a nearly stationary object to
+        # a distant court line. This is a common failure mode in camera videos.
+        if previous_distance < 50.0 and distance > 350.0:
+            return -1e9
 
         if previous_distance > 2.0 and distance > 1.0:
             dot = (pdx * dx + pdy * dy) / (
@@ -374,6 +402,7 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
     frame_no = start_frame + step
 
     misses = 0
+    stalled = 0
     while 0 <= frame_no < total_frames:
         candidates = frame_candidates[frame_no]
 
@@ -407,6 +436,21 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
             continue
 
         misses = 0
+
+        step_distance = math.hypot(
+            best["x"] - previous["x"],
+            best["y"] - previous["y"],
+        )
+        if step_distance < 3.0:
+            stalled += 1
+        else:
+            stalled = 0
+
+        # A genuine shuttle trajectory cannot remain pixel-stationary for
+        # dozens of frames. Stop this path before it contaminates confidence.
+        if stalled >= 8:
+            break
+
         previous_previous = previous
         previous = best
         previous_frame = frame_no
@@ -440,13 +484,16 @@ def track_shuttle(frame_candidates_by_frame):
 
     seed_frame, seed_candidates = max(
         usable,
-        key=lambda item: max(c["score"] for c in item[1])
+        key=lambda item: max(
+            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
+            for c in item[1]
+        )
     )
     seed_candidates = sorted(
         seed_candidates,
-        key=lambda c: c["score"],
+        key=lambda c: c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0)),
         reverse=True,
-    )[:4]
+    )[:8]
 
     best_path = []
     best_quality = -1e9
@@ -480,9 +527,13 @@ def track_shuttle(frame_candidates_by_frame):
                 )
             smoothness = 1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0)))
             length_score = min(1.0, len(path) / 10.0)
+            x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
+            y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
+            movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
             quality = (
-                0.45 * smoothness
-                + 0.40 * length_score
+                0.35 * smoothness
+                + 0.30 * length_score
+                + 0.20 * movement_score
                 + 0.15 * seed["score"]
             )
 
@@ -506,7 +557,19 @@ def track_shuttle(frame_candidates_by_frame):
         1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0))),
     )
     length_score = min(1.0, len(best_path) / 10.0)
-    confidence = 0.50 * smoothness + 0.50 * length_score
+    x_span = max(p["x"] for p in best_path) - min(p["x"] for p in best_path)
+    y_span = max(p["y"] for p in best_path) - min(p["y"] for p in best_path)
+    movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
+
+    # Require meaningful spatial movement before reporting a confident track.
+    if movement_score < 0.20:
+        return best_path, 0.0
+
+    confidence = (
+        0.40 * smoothness
+        + 0.35 * length_score
+        + 0.25 * movement_score
+    )
 
     return best_path, float(confidence)
 
@@ -519,6 +582,21 @@ def choose_landing_point(trajectory, fps):
     than blindly averaging all final contours.
     """
     if len(trajectory) < 3:
+        return None
+
+    # Reject tracks that are effectively stationary; these are typically
+    # court markings, lights, players' clothing, or other static objects.
+    x_span = max(p["x"] for p in trajectory) - min(p["x"] for p in trajectory)
+    y_span = max(p["y"] for p in trajectory) - min(p["y"] for p in trajectory)
+    if math.hypot(x_span, y_span) < 36.0:
+        return None
+
+    # A camera can see the shuttle leave the frame. That is not a landing.
+    # In the portrait court videos used for ShuttleEye, a landing candidate
+    # near the extreme top/bottom image edge is not trustworthy.
+    final_y = trajectory[-1]["y"]
+    final_x = trajectory[-1]["x"]
+    if final_y < 80 or final_y > 1880 or final_x < 10 or final_x > 1070:
         return None
 
     recent = trajectory[-12:]
