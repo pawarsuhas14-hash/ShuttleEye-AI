@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.3.0",
+        "version": "1.4.0",
     }
 
 
@@ -574,63 +574,117 @@ def track_shuttle(frame_candidates_by_frame):
     return best_path, float(confidence)
 
 
-def choose_landing_point(trajectory, fps):
+def choose_landing_point(trajectory, fps, court_corners=None):
     """
-    Estimate the landing point from the end/downward phase of the trajectory.
+    Conservative landing estimator.
 
-    We prefer the lowest reliable point in the final part of the track rather
-    than blindly averaging all final contours.
+    A badminton shuttle should not be declared landed merely because the
+    tracker ended near the court. We require evidence of a downward phase:
+    several points moving toward larger image-Y values followed by a local
+    maximum (the lowest visible point). If the trajectory leaves the frame,
+    or never shows a credible downward phase, return UNKNOWN.
+
+    This deliberately prefers UNKNOWN over a potentially wrong IN/OUT call.
     """
-    if len(trajectory) < 3:
+    if len(trajectory) < 4:
         return None
 
-    # Reject tracks that are effectively stationary; these are typically
-    # court markings, lights, players' clothing, or other static objects.
+    # Reject trajectories that barely move.
     x_span = max(p["x"] for p in trajectory) - min(p["x"] for p in trajectory)
     y_span = max(p["y"] for p in trajectory) - min(p["y"] for p in trajectory)
-    if math.hypot(x_span, y_span) < 36.0:
+    if math.hypot(x_span, y_span) < 50.0:
         return None
 
-    # A camera can see the shuttle leave the frame. That is not a landing.
-    # In the portrait court videos used for ShuttleEye, a landing candidate
-    # near the extreme top/bottom image edge is not trustworthy.
-    final_y = trajectory[-1]["y"]
-    final_x = trajectory[-1]["x"]
-    if final_y < 80 or final_y > 1880 or final_x < 10 or final_x > 1070:
+    # A shuttle leaving the image is not a landing.
+    h_limit = 1920
+    w_limit = 1080
+    last = trajectory[-1]
+    if (
+        last["y"] < 40 or last["y"] > h_limit - 20
+        or last["x"] < 5 or last["x"] > w_limit - 5
+    ):
         return None
 
-    recent = trajectory[-12:]
+    # Work through the full trajectory looking for a sustained downward phase.
+    # In the normal portrait court view, image-Y increases toward the floor.
+    best_idx = None
+    best_y = -1
 
-    # Look for the point with the greatest y after the trajectory begins
-    # moving downward. In a normal court-facing phone view, larger y is closer
-    # to the floor.
-    best = recent[-1]
-    if len(recent) >= 4:
-        for i in range(1, len(recent)):
-            dy = recent[i]["y"] - recent[i - 1]["y"]
-            if dy >= 0:
-                if recent[i]["y"] >= best["y"]:
-                    best = recent[i]
+    for i in range(2, len(trajectory) - 1):
+        p0 = trajectory[i - 2]
+        p1 = trajectory[i - 1]
+        p2 = trajectory[i]
+        p3 = trajectory[i + 1]
 
-    # Robust weighted average of the final 3-5 points around the landing area.
-    anchor_index = recent.index(best)
-    start = max(0, anchor_index - 2)
-    end = min(len(recent), anchor_index + 2)
-    local = recent[start:end]
+        d1 = p1["y"] - p0["y"]
+        d2 = p2["y"] - p1["y"]
+        after = p3["y"] - p2["y"]
+
+        # Require two consecutive downward movements before the candidate.
+        if d1 >= 2 and d2 >= 2 and p2["y"] >= p1["y"]:
+            # A genuine landing candidate should be near a local maximum in Y.
+            # Allow a small post-contact movement, but reject a large reversal.
+            if after <= 15 and p2["y"] > best_y:
+                best_idx = i
+                best_y = p2["y"]
+
+    if best_idx is None:
+        return None
+
+    # Do not call a point a landing if it is followed by a large upward jump.
+    if best_idx + 1 < len(trajectory):
+        next_p = trajectory[best_idx + 1]
+        if trajectory[best_idx]["y"] - next_p["y"] > 80:
+            return None
+
+    # Average a small neighborhood around the detected low point.
+    start_i = max(0, best_idx - 1)
+    end_i = min(len(trajectory), best_idx + 2)
+    local = trajectory[start_i:end_i]
 
     if len(local) < 2:
-        local = recent[-3:]
+        return None
 
     weights = np.arange(1, len(local) + 1, dtype=np.float32)
     xs = np.array([p["x"] for p in local], dtype=np.float32)
     ys = np.array([p["y"] for p in local], dtype=np.float32)
 
-    return {
-        "frame": int(local[-1]["frame"]),
+    landing = {
+        "frame": int(trajectory[best_idx]["frame"]),
         "x": int(round(float(np.average(xs, weights=weights)))),
         "y": int(round(float(np.average(ys, weights=weights)))),
-        "method": "downward_phase_weighted_trajectory",
+        "method": "conservative_downward_phase",
     }
+
+    # If a court polygon is available, the candidate must be reasonably near
+    # it. This prevents a random moving object elsewhere in the image from
+    # being treated as a court landing.
+    if court_corners:
+        try:
+            if isinstance(court_corners, dict):
+                polygon_points = [
+                    court_corners["top_left"],
+                    court_corners["top_right"],
+                    court_corners["bottom_right"],
+                    court_corners["bottom_left"],
+                ]
+            else:
+                polygon_points = list(court_corners)
+
+            polygon = np.array(polygon_points, dtype=np.float32)
+            distance = cv2.pointPolygonTest(
+                polygon,
+                (float(landing["x"]), float(landing["y"])),
+                True,
+            )
+
+            # A point far outside the court is not a credible landing point.
+            if distance < -250.0:
+                return None
+        except Exception:
+            pass
+
+    return landing
 
 
 @app.post("/analyze-video")
@@ -717,7 +771,7 @@ async def analyze_video(video: UploadFile = File(...)):
         shuttle_detected = len(trajectory) >= 3
 
         estimated_landing_point = (
-            choose_landing_point(trajectory, fps)
+            choose_landing_point(trajectory, fps, court_corners)
             if shuttle_detected
             else None
         )
