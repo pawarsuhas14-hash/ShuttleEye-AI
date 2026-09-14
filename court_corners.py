@@ -231,12 +231,14 @@ def _order_corners(points):
     if area < 0:
         ordered = ordered[[0, 3, 2, 1]]
 
-    return [
-        _point_to_tuple(ordered[0]),
-        _point_to_tuple(ordered[1]),
-        _point_to_tuple(ordered[2]),
-        _point_to_tuple(ordered[3]),
-    ]
+    # Return named corners because the landing-decision engine consumes
+    # court geometry by key (top_left/top_right/bottom_right/bottom_left).
+    return {
+        "top_left": _point_to_tuple(ordered[0]),
+        "top_right": _point_to_tuple(ordered[1]),
+        "bottom_right": _point_to_tuple(ordered[2]),
+        "bottom_left": _point_to_tuple(ordered[3]),
+    }
 
 
 def _score_quad(quad, group_a, group_b, width, height):
