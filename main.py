@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="2.1.2",
+    version="2.1.3",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "2.1.2",
+        "version": "2.1.3",
     }
 
 
@@ -146,7 +146,52 @@ def build_court_region(frame, court_corners):
             + 0.325 * parallel_b
         )
 
-        if area_ratio <= 0.50 and geometry_score >= 0.58:
+        # A geometrically neat quad is not enough: Hough can lock onto walls,
+        # phone framing, or other long structures.  Require visible court-line
+        # evidence before trusting the four-corner result.
+        hsv_geom = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        value_geom = hsv_geom[:, :, 2]
+        sat_geom = hsv_geom[:, :, 1]
+        geom_mask = ((value_geom >= 150) & (sat_geom <= 130)).astype(np.uint8)
+        geom_mask = cv2.morphologyEx(
+            geom_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+        )
+
+        edge_support = []
+        for i in range(4):
+            a = polygon[i]
+            b = polygon[(i + 1) % 4]
+            edge_len = float(np.linalg.norm(b - a))
+            if edge_len < 1.0:
+                edge_support.append(0.0)
+                continue
+            samples = max(24, int(edge_len / 4.0))
+            ts = np.linspace(0.0, 1.0, samples)
+            hits = 0
+            for t in ts:
+                px, py = np.round(a + (b - a) * t).astype(int)
+                if 0 <= px < w and 0 <= py < h:
+                    r = 3
+                    patch = geom_mask[max(0, py-r):min(h, py+r+1),
+                                       max(0, px-r):min(w, px+r+1)]
+                    if patch.size and float(np.mean(patch)) >= 0.25:
+                        hits += 1
+            edge_support.append(hits / float(samples))
+
+        near_frame = 0
+        frame_tol_x = max(8.0, 0.025 * w)
+        frame_tol_y = max(8.0, 0.025 * h)
+        for x, y in polygon:
+            if x <= frame_tol_x or x >= (w - 1 - frame_tol_x) or y <= frame_tol_y or y >= (h - 1 - frame_tol_y):
+                near_frame += 1
+
+        support_ok = (
+            max(edge_support) >= 0.42
+            and sorted(edge_support, reverse=True)[1] >= 0.08
+            and near_frame <= 2
+        )
+
+        if area_ratio <= 0.50 and geometry_score >= 0.58 and support_ok:
             return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
         # ------------------------------------------------------------------
