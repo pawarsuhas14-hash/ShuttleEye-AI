@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from court_corners import get_court_corners
 import cv2
 import numpy as np
@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.5.0",
+    version="1.6.1",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.5.0",
+        "version": "1.6.1",
     }
 
 
@@ -574,6 +574,72 @@ def track_shuttle(frame_candidates_by_frame):
     return best_path, float(confidence)
 
 
+def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None,
+                       decision=None):
+    """
+    Create a compact annotated frame for visual debugging.
+    This is intentionally separate from the API response so we can later
+    expose an annotated JPEG/video without changing the detection pipeline.
+    """
+    debug = frame.copy()
+
+    # Court polygon.
+    if court_corners:
+        try:
+            if isinstance(court_corners, dict):
+                pts = [
+                    court_corners["top_left"],
+                    court_corners["top_right"],
+                    court_corners["bottom_right"],
+                    court_corners["bottom_left"],
+                ]
+            else:
+                pts = list(court_corners)
+
+            poly = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(debug, [poly], True, (255, 180, 0), 4)
+        except Exception:
+            pass
+
+    # Trajectory.
+    if trajectory:
+        pts = [(int(p["x"]), int(p["y"])) for p in trajectory]
+        for a, b in zip(pts[:-1], pts[1:]):
+            cv2.line(debug, a, b, (255, 0, 255), 4)
+
+        for p in pts:
+            cv2.circle(debug, p, 8, (0, 255, 255), -1)
+
+        # Latest tracked position.
+        cv2.circle(debug, pts[-1], 16, (0, 255, 0), 3)
+
+    # Estimated landing.
+    if landing_point:
+        lp = (int(landing_point["x"]), int(landing_point["y"]))
+        cv2.circle(debug, lp, 25, (0, 0, 255), 5)
+        cv2.drawMarker(
+            debug, lp, (0, 0, 255),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=50,
+            thickness=5,
+        )
+
+    # Decision banner.
+    result = None
+    if isinstance(decision, dict):
+        result = decision.get("result")
+
+    label = f"ShuttleEye 1.6 | {result or 'TRACKING'}"
+    cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
+    cv2.putText(
+        debug, label, (40, 68),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3,
+        cv2.LINE_AA,
+    )
+
+    return debug
+
+
 def choose_landing_point(trajectory, fps, court_corners=None):
     """
     Conservative landing estimator with bounce/reversal detection.
@@ -697,6 +763,155 @@ def choose_landing_point(trajectory, fps, court_corners=None):
             pass
 
     return landing
+
+
+@app.post("/debug-video")
+async def debug_video(video: UploadFile = File(...)):
+    """
+    Analyze the uploaded video using the same detector/tracker and return
+    one annotated JPEG frame for visual verification.
+
+    Overlay:
+      - court polygon
+      - tracked trajectory
+      - latest tracked position
+      - estimated landing point (when available)
+      - IN/OUT/UNKNOWN decision
+    """
+    input_path = None
+    try:
+        file_id = str(uuid.uuid4())
+        safe_filename = os.path.basename(video.filename or "video.mp4")
+        input_path = f"/tmp/{file_id}_{safe_filename}"
+
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Could not open video"},
+            )
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        success, first_frame = cap.read()
+        if not success:
+            cap.release()
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Could not read video"},
+            )
+
+        court_analysis = detect_court(first_frame)
+        court_corners = get_court_corners(first_frame)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        previous_gray = None
+        previous_previous_gray = None
+        frame_candidates_by_frame = []
+
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+
+            current_gray, candidates = extract_frame_candidates(
+                frame,
+                previous_gray,
+                previous_previous_gray,
+            )
+            frame_candidates_by_frame.append(candidates)
+            previous_previous_gray = previous_gray
+            previous_gray = current_gray
+
+        cap.release()
+
+        trajectory, tracking_confidence = track_shuttle(
+            frame_candidates_by_frame
+        )
+        landing_point = (
+            choose_landing_point(trajectory, fps, court_corners)
+            if len(trajectory) >= 3
+            else None
+        )
+        decision = check_landing_inside_court(
+            landing_point,
+            court_corners,
+        )
+
+        # Use the landing frame when available; otherwise show the final
+        # tracked frame so we can inspect exactly what the tracker followed.
+        if landing_point:
+            debug_frame_index = int(landing_point["frame"])
+        elif trajectory:
+            debug_frame_index = int(trajectory[-1]["frame"])
+        else:
+            debug_frame_index = max(0, total_frames - 1)
+
+        cap = cv2.VideoCapture(input_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, debug_frame_index)
+        success, debug_frame = cap.read()
+        cap.release()
+
+        if not success:
+            debug_frame = first_frame
+
+        debug_frame = create_debug_frame(
+            debug_frame,
+            trajectory,
+            court_corners,
+            landing_point,
+            decision,
+        )
+
+        result = decision.get("result", "UNKNOWN") if isinstance(decision, dict) else "UNKNOWN"
+        cv2.putText(
+            debug_frame,
+            f"Confidence: {tracking_confidence:.2f}",
+            (40, 135),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        ok, encoded = cv2.imencode(".jpg", debug_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        if not ok:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Could not encode debug image"},
+            )
+
+        return Response(
+            content=encoded.tobytes(),
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": 'inline; filename="shuttleeye_debug.jpg"',
+                "X-ShuttleEye-Result": str(result),
+                "X-ShuttleEye-Tracked-Points": str(len(trajectory)),
+                "X-ShuttleEye-Confidence": f"{tracking_confidence:.3f}",
+                "X-ShuttleEye-Debug-Frame": str(debug_frame_index),
+            },
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": f"Debug analysis failed: {str(e)}",
+            },
+        )
+    finally:
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
 
 
 @app.post("/analyze-video")
