@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, Response
-from court_corners import get_court_corners, line_intersection
+from court_corners import get_court_corners
 import cv2
 import numpy as np
 import os
@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="2.0.0",
+    version="2.1.2",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "2.0.0",
+        "version": "2.1.2",
     }
 
 
@@ -92,13 +92,12 @@ def detect_court(frame):
 
 
 def build_court_region(frame, court_corners):
-    """Build a colour- and orientation-independent playable court region.
+    """Build a playable court region without assuming camera orientation or court colour.
 
-    The normal case is a validated four-corner quadrilateral. When the corner
-    detector returns an implausibly large frame-spanning polygon, do not trust
-    it. Instead, search the visible court-line network for a strong interior
-    boundary and infer which side contains the court. This fallback is
-    orientation-independent and is deliberately conservative.
+    Prefer a validated quadrilateral. If the corner detector produces a
+    frame-spanning polygon, use the visible court-line network to find a
+    substantial interior boundary and infer the playable side from the amount
+    of perpendicular court-line support on each side.
     """
     if frame is None or not court_corners:
         return court_corners, "court_not_detected"
@@ -122,11 +121,11 @@ def build_court_region(frame, court_corners):
 
         polygon = hull.astype(np.float32)
         area_ratio = abs(float(cv2.contourArea(polygon))) / float(max(1, w * h))
-
         side_lengths = [
             float(np.linalg.norm(polygon[(i + 1) % 4] - polygon[i]))
             for i in range(4)
         ]
+
         if min(side_lengths) < max(35.0, min(w, h) * 0.025):
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
         if max(side_lengths) / max(min(side_lengths), 1.0) > 18.0:
@@ -141,325 +140,200 @@ def build_court_region(frame, court_corners):
         ev = [polygon[(i + 1) % 4] - polygon[i] for i in range(4)]
         parallel_a = direction_similarity(ev[0], ev[2])
         parallel_b = direction_similarity(ev[1], ev[3])
-        geometry_score = 0.35 * min(1.0, area_ratio / 0.25) + 0.325 * parallel_a + 0.325 * parallel_b
+        geometry_score = (
+            0.35 * min(1.0, area_ratio / 0.25)
+            + 0.325 * parallel_a
+            + 0.325 * parallel_b
+        )
 
-        # A moderate, coherent quadrilateral is the preferred solution.
-        # Large frame-spanning polygons need additional line-network evidence.
         if area_ratio <= 0.50 and geometry_score >= 0.58:
             return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
-        # ---- Interior-boundary fallback for partial/inside-camera views ----
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.bitwise_or(
-            cv2.Canny(gray, 35, 110),
-            cv2.Canny(gray, 60, 160),
+        # ------------------------------------------------------------------
+        # Fallback: identify an interior court boundary from bright court
+        # lines. Badminton boundary lines are normally bright/low-saturation;
+        # this does NOT assume a green/blue/red court surface and does not
+        # assume the boundary is vertical/horizontal.
+        # ------------------------------------------------------------------
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        value = hsv[:, :, 2]
+        saturation = hsv[:, :, 1]
+        line_mask = ((value >= 150) & (saturation <= 130)).astype(np.uint8)
+        line_mask = cv2.morphologyEx(
+            line_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
         )
 
         raw = cv2.HoughLinesP(
-            edges,
+            line_mask * 255,
             1,
             np.pi / 180.0,
-            40,
-            minLineLength=max(45, int(min(w, h) * 0.10)),
-            maxLineGap=35,
+            25,
+            minLineLength=max(55, int(min(w, h) * 0.15)),
+            maxLineGap=28,
         )
-
-        raw_lines = []
-        if raw is not None:
-            for r in raw:
-                vals = np.asarray(r).reshape(-1)
-                if len(vals) < 4:
-                    continue
-                x1, y1, x2, y2 = [float(v) for v in vals[:4]]
-                length = math.hypot(x2 - x1, y2 - y1)
-                if length >= max(45.0, min(w, h) * 0.10):
-                    raw_lines.append((x1, y1, x2, y2, length))
-
-        if not raw_lines:
+        if raw is None:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        # Merge fragmented collinear Hough segments. This is important for
-        # mobile footage where one physical court line can be broken by
-        # shadows, blur, or players.
-        def merge_segments(segments):
-            used = [False] * len(segments)
-            merged = []
-            angle_tol = 5.0
-            distance_tol = max(8.0, min(w, h) * 0.012)
-            gap_tol = max(50.0, min(w, h) * 0.10)
+        lines = []
+        for r in raw:
+            vals = np.asarray(r).reshape(-1)
+            if len(vals) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in vals[:4]]
+            length = math.hypot(x2 - x1, y2 - y1)
+            if length < max(55.0, min(w, h) * 0.15):
+                continue
+            angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+            lines.append((x1, y1, x2, y2, length, angle))
 
-            for i, base in enumerate(segments):
-                if used[i]:
-                    continue
-
-                group = [i]
-                used[i] = True
-                changed = True
-
-                while changed:
-                    changed = False
-                    bx1, by1, bx2, by2, bl = segments[group[0]]
-                    bu = np.array([bx2 - bx1, by2 - by1], dtype=np.float32)
-                    bu /= max(float(np.linalg.norm(bu)), 1e-6)
-                    bn = np.array([-bu[1], bu[0]], dtype=np.float32)
-                    bmid = (np.array([bx1, by1]) + np.array([bx2, by2])) * 0.5
-                    boff = float(np.dot(bmid, bn))
-                    bmin = min(
-                        float(np.dot(np.array([bx1, by1]), bu)),
-                        float(np.dot(np.array([bx2, by2]), bu)),
-                    )
-                    bmax = max(
-                        float(np.dot(np.array([bx1, by1]), bu)),
-                        float(np.dot(np.array([bx2, by2]), bu)),
-                    )
-
-                    for j, cand in enumerate(segments):
-                        if used[j]:
-                            continue
-                        cx1, cy1, cx2, cy2, cl = cand
-                        cu = np.array([cx2 - cx1, cy2 - cy1], dtype=np.float32)
-                        cu /= max(float(np.linalg.norm(cu)), 1e-6)
-                        angle = math.degrees(
-                            math.acos(
-                                min(1.0, abs(float(np.dot(bu, cu))))
-                            )
-                        )
-                        if angle > angle_tol:
-                            continue
-
-                        cmid = (np.array([cx1, cy1]) + np.array([cx2, cy2])) * 0.5
-                        if abs(float(np.dot(cmid, bn)) - boff) > distance_tol:
-                            continue
-
-                        cts = [
-                            float(np.dot(np.array([cx1, cy1]), bu)),
-                            float(np.dot(np.array([cx2, cy2]), bu)),
-                        ]
-                        if max(cts) < bmin - gap_tol or min(cts) > bmax + gap_tol:
-                            continue
-
-                        group.append(j)
-                        used[j] = True
-                        changed = True
-
-                pts = []
-                for j in group:
-                    x1, y1, x2, y2, _ = segments[j]
-                    pts.extend([
-                        np.array([x1, y1], dtype=np.float32),
-                        np.array([x2, y2], dtype=np.float32),
-                    ])
-
-                x1, y1, x2, y2, _ = segments[group[0]]
-                u = np.array([x2 - x1, y2 - y1], dtype=np.float32)
-                u /= max(float(np.linalg.norm(u)), 1e-6)
-                n = np.array([-u[1], u[0]], dtype=np.float32)
-                offset = float(np.mean([np.dot(p, n) for p in pts]))
-                tvals = [float(np.dot(p, u)) for p in pts]
-                pmin = u * min(tvals) + n * offset
-                pmax = u * max(tvals) + n * offset
-                merged.append((
-                    float(pmin[0]), float(pmin[1]),
-                    float(pmax[0]), float(pmax[1]),
-                    float(np.linalg.norm(pmax - pmin)),
-                ))
-
-            return merged
-
-        lines = merge_segments(raw_lines)
         if not lines:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        # A line is useful only if it has real line/edge support. We use
-        # brightness merely as a generic line-strength signal; no court colour
-        # or court orientation is assumed.
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        line_support_mask = (
-            (hsv[:, :, 1] < 110) & (hsv[:, :, 2] > 145)
-        ).astype(np.uint8)
-
-        def line_support(line, width=4):
-            x1, y1, x2, y2, length = line
-            count = max(30, int(length))
-            xs = np.linspace(x1, x2, count)
-            ys = np.linspace(y1, y2, count)
-            dx = x2 - x1
-            dy = y2 - y1
-            ln = max(length, 1e-6)
-            nx = -dy / ln
-            ny = dx / ln
-            samples = []
-            for off in range(-width, width + 1):
-                xi = np.clip(np.rint(xs + off * nx).astype(np.int32), 0, w - 1)
-                yi = np.clip(np.rint(ys + off * ny).astype(np.int32), 0, h - 1)
-                samples.append(float(line_support_mask[yi, xi].mean()))
-            return float(np.mean(samples))
-
-        supports = [line_support(line) for line in lines]
         best = None
+        min_dim = float(min(w, h))
+        frame_diag = math.hypot(w, h)
 
         for idx, line in enumerate(lines):
-            x1, y1, x2, y2, length = line
-            midpoint = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
-            edge_clearance = min(
-                float(midpoint[0]),
-                float(midpoint[1]),
-                float(w - midpoint[0]),
-                float(h - midpoint[1]),
-            )
-            if edge_clearance < min(w, h) * 0.055:
+            x1, y1, x2, y2, length, angle = line
+            # The boundary itself should be a substantial image structure;
+            # shorter court lines are used only as supporting evidence.
+            if length < 0.40 * max(w, h):
                 continue
 
-            u = np.array([x2 - x1, y2 - y1], dtype=np.float32)
-            u /= max(float(np.linalg.norm(u)), 1e-6)
-            n = np.array([-u[1], u[0]], dtype=np.float32)
+            p1 = np.array([x1, y1], dtype=np.float32)
+            p2 = np.array([x2, y2], dtype=np.float32)
+            tangent = (p2 - p1) / max(length, 1e-6)
+            normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+            midpoint = (p1 + p2) * 0.5
+
+            # Ignore structures whose midpoint is very close to a frame edge.
+            edge_clearance = min(
+                float(midpoint[0]), float(midpoint[1]),
+                float(w - midpoint[0]), float(h - midpoint[1])
+            )
+            if edge_clearance < 0.035 * min_dim:
+                continue
 
             side_length = [0.0, 0.0]
-            crossing_count = [0, 0]
+            side_count = [0, 0]
+            near_crossings = [0, 0]
 
             for j, other in enumerate(lines):
-                if j == idx or supports[j] < 0.22:
+                if j == idx:
                     continue
-
-                ox1, oy1, ox2, oy2, olen = other
+                ox1, oy1, ox2, oy2, olen, oangle = other
                 ov = np.array([ox2 - ox1, oy2 - oy1], dtype=np.float32)
-                ov /= max(float(np.linalg.norm(ov)), 1e-6)
-
-                # Court line families are approximately perpendicular in the
-                # image even under rotation/perspective.
-                if abs(float(np.dot(ov, u))) > 0.38:
+                on = np.linalg.norm(ov)
+                if on < 1e-6:
                     continue
 
-                try:
-                    ip = line_intersection(
-                        {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                        {"x1": ox1, "y1": oy1, "x2": ox2, "y2": oy2},
-                    )
-                except Exception:
-                    ip = None
-
-                if ip is None:
+                # Perpendicular (within perspective tolerance) lines are the
+                # strongest evidence of a court-line network.
+                if abs(float(np.dot(ov / on, tangent))) > 0.42:
                     continue
 
-                ip = np.array(ip, dtype=np.float32)
-                along = float(np.dot(ip - np.array([x1, y1], dtype=np.float32), u))
-                other_along = float(
-                    np.dot(ip - np.array([ox1, oy1], dtype=np.float32), ov)
-                )
-                if not (-35.0 <= along <= length + 35.0):
+                omp = np.array([(ox1 + ox2) * 0.5, (oy1 + oy2) * 0.5], dtype=np.float32)
+                signed = float(np.dot(omp - midpoint, normal))
+                side = 0 if signed >= 0 else 1
+
+                # Only count clearly separated line support. The boundary line
+                # itself should not make both sides look equally rich.
+                separation = abs(signed)
+                if separation < max(8.0, 0.018 * min_dim):
                     continue
-                if not (-35.0 <= other_along <= olen + 35.0):
-                    continue
 
-                # Use the actual amount of the crossing line on each side.
-                s1 = float(np.dot(np.array([ox1, oy1], dtype=np.float32) - ip, n))
-                s2 = float(np.dot(np.array([ox2, oy2], dtype=np.float32) - ip, n))
-                if s1 * s2 < 0:
-                    side_length[0 if s1 >= 0 else 1] += abs(s1)
-                    side_length[0 if s2 >= 0 else 1] += abs(s2)
-                else:
-                    side = 0 if float(np.dot(ip - midpoint, n)) >= 0 else 1
-                    side_length[side] += olen
+                weight = min(olen, 0.85 * min_dim)
+                side_length[side] += weight
+                side_count[side] += 1
 
-                side = 0 if float(np.dot(ip - midpoint, n)) >= 0 else 1
-                crossing_count[side] += 1
+                # A line whose segment comes close to the candidate boundary
+                # is especially useful evidence of a real court intersection.
+                rel1 = np.array([ox1, oy1], dtype=np.float32) - p1
+                rel2 = np.array([ox2, oy2], dtype=np.float32) - p1
+                along1 = float(np.dot(rel1, tangent))
+                along2 = float(np.dot(rel2, tangent))
+                if max(along1, along2) >= -35.0 and min(along1, along2) <= length + 35.0:
+                    near_crossings[side] += 1
 
-            total = side_length[0] + side_length[1]
-            if total < 100.0:
+            total_support = side_length[0] + side_length[1]
+            if total_support < 0.55 * min_dim:
                 continue
 
             richer = 0 if side_length[0] >= side_length[1] else 1
             poorer = 1 - richer
             imbalance = (
-                (side_length[richer] - side_length[poorer])
-                / max(total, 1.0)
-            )
-            crossings = min(1.0, crossing_count[richer] / 3.0)
-            length_score = min(
-                1.0,
-                length / max(min(w, h) * 0.50, 1.0),
-            )
+                side_length[richer] - side_length[poorer]
+            ) / max(total_support, 1.0)
+            count_support = min(1.0, side_count[richer] / 4.0)
+            crossing_support = min(1.0, near_crossings[richer] / 3.0)
+            length_support = min(1.0, length / max(0.60 * min_dim, 1.0))
+            centrality = min(1.0, edge_clearance / max(0.25 * min_dim, 1.0))
 
-            # Multiple strong perpendicular crossings are the key signal.
-            # This prevents a long service line from beating a true outer
-            # boundary line just because the service line is brighter.
             score = (
-                0.20 * supports[idx]
-                + 0.20 * imbalance
-                + 0.45 * crossings
-                + 0.15 * length_score
+                0.40 * imbalance
+                + 0.25 * count_support
+                + 0.20 * crossing_support
+                + 0.10 * length_support
+                + 0.05 * centrality
             )
 
             if best is None or score > best[0]:
-                best = (
-                    score,
-                    line,
-                    n,
-                    richer,
-                    supports[idx],
-                    crossing_count,
-                    side_length,
-                )
+                best = (score, line, normal, richer, side_length, side_count)
 
-        if best is None or best[0] < 0.45:
+        if best is None or best[0] < 0.38:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        score, line, normal, richer, support, crossing_count, side_length = best
-        x1, y1, x2, y2, length = line
-        tangent = np.array([x2 - x1, y2 - y1], dtype=np.float32)
-        tangent /= max(float(np.linalg.norm(tangent)), 1e-6)
-
-        # Keep the court on the side where the strongest perpendicular court
-        # network is visible.
+        score, line, normal, richer, side_length, side_count = best
+        x1, y1, x2, y2, length, angle = line
+        p1 = np.array([x1, y1], dtype=np.float32)
+        p2 = np.array([x2, y2], dtype=np.float32)
+        tangent = (p2 - p1) / max(length, 1e-6)
         chosen_normal = normal if richer == 0 else -normal
 
-        # Clip the selected half-plane to the camera frame. This produces a
-        # stable visible-side region without assuming left/right/up/down.
-        frame_poly = [
-            np.array([0.0, 0.0], dtype=np.float32),
-            np.array([float(w), 0.0], dtype=np.float32),
-            np.array([float(w), float(h)], dtype=np.float32),
-            np.array([0.0, float(h)], dtype=np.float32),
-        ]
-        p0 = np.array([x1, y1], dtype=np.float32)
+        # Extend the boundary line to the image edges, then take the inferred
+        # playable half-plane. This handles arbitrary camera rotation.
+        intersections = []
+        for x_edge in (0.0, float(w - 1)):
+            if abs(tangent[0]) > 1e-6:
+                t = (x_edge - p1[0]) / tangent[0]
+                y = p1[1] + t * tangent[1]
+                if -frame_diag <= y <= h - 1 + frame_diag:
+                    intersections.append(np.array([x_edge, y], dtype=np.float32))
+        for y_edge in (0.0, float(h - 1)):
+            if abs(tangent[1]) > 1e-6:
+                t = (y_edge - p1[1]) / tangent[1]
+                x = p1[0] + t * tangent[0]
+                if -frame_diag <= x <= w - 1 + frame_diag:
+                    intersections.append(np.array([x, y_edge], dtype=np.float32))
 
-        def inside_halfplane(p):
-            return float(np.dot(p - p0, chosen_normal)) >= 0.0
-
-        clipped = []
-        for a, b in zip(frame_poly, frame_poly[1:] + frame_poly[:1]):
-            ina = inside_halfplane(a)
-            inb = inside_halfplane(b)
-
-            if ina:
-                clipped.append(a)
-
-            if ina != inb:
-                d = b - a
-                denom = float(np.dot(d, chosen_normal))
-                if abs(denom) > 1e-6:
-                    t = -float(np.dot(a - p0, chosen_normal)) / denom
-                    t = min(1.0, max(0.0, t))
-                    clipped.append(a + t * d)
-
-        if len(clipped) < 3:
+        if len(intersections) < 2:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        region = np.array(clipped, dtype=np.float32)
-        region = cv2.convexHull(region).reshape(-1, 2)
+        # Keep the two intersections that are farthest apart.
+        pair = max(
+            ((a, b) for i, a in enumerate(intersections) for b in intersections[i + 1:]),
+            key=lambda ab: float(np.linalg.norm(ab[1] - ab[0]))
+        )
+        a, b = pair
+        extension = frame_diag * 1.5
+        a = a - tangent * extension
+        b = b + tangent * extension
+        c = b + chosen_normal * extension
+        d = a + chosen_normal * extension
+        region = np.array([a, b, c, d], dtype=np.float32)
 
-        # Require the inferred region to be substantial but not almost the
-        # entire frame. Otherwise we are probably looking at a wall/structure.
-        region_area = abs(float(cv2.contourArea(region)))
-        if region_area < 0.08 * w * h or region_area > 0.90 * w * h:
+        # Clip to frame with a convex hull; this creates a stable half-plane
+        # polygon for point-in-polygon testing.
+        region[:, 0] = np.clip(region[:, 0], 0, w - 1)
+        region[:, 1] = np.clip(region[:, 1], 0, h - 1)
+        region = cv2.convexHull(region.astype(np.float32)).reshape(-1, 2)
+        if len(region) < 4:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        return region.astype(np.int32).tolist(), "visible_side_region"
+        return region.astype(np.int32).tolist(), "geometry_polygon"
 
     except Exception:
         return court_corners, "low_confidence_polygon"
-
 
 def check_landing_inside_court(landing_point, court_corners, margin=0):
     if landing_point is None:
@@ -1086,7 +960,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 2.0 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 2.1.2 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -1473,10 +1347,22 @@ async def analyze_video(video: UploadFile = File(...)):
             else None
         )
 
-        landing_decision = check_landing_inside_court(
-            estimated_landing_point,
-            court_region,
-        )
+        if court_region_mode == "geometry_polygon":
+            landing_decision = check_landing_inside_court(
+                estimated_landing_point,
+                court_region,
+            )
+        else:
+            landing_decision = {
+                "result": "UNKNOWN",
+                "inside": None,
+                "boundary_distance_pixels": None,
+                "message": (
+                    "Court boundary is not reliable enough for an IN/OUT call. "
+                    "Reposition the phone so multiple court boundary lines and "
+                    "court corners are clearly visible."
+                ),
+            }
 
         motion_percentage = (
             motion_frames / processed_frames * 100.0
