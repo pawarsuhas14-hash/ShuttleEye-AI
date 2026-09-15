@@ -159,7 +159,7 @@ def build_court_region(frame, court_corners):
         # 'inside' is the +normal side of the left edge.  If the opposite
         # side has substantially more court-line structure, the polygon is
         # likely on the wrong side.
-        if inside_score > outside_score * 1.35 and inside_score > 1.5:
+        if outside_score > inside_score * 1.35 and outside_score > 1.5:
             # Build the visible court region between the sideline and the
             # image's left edge, using the detected top/bottom intersections.
             region = np.array([
@@ -615,7 +615,23 @@ def track_shuttle(frame_candidates_by_frame):
     seed_frame, seed_candidates = max(
         usable,
         key=lambda item: max(
-            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
+            (
+                c["score"]
+                * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
+                * (
+                    1.0
+                    + 0.35
+                    * sum(
+                        1
+                        for j in range(
+                            max(0, item[0] - 3),
+                            min(len(frame_candidates_by_frame), item[0] + 4),
+                        )
+                        if j != item[0] and frame_candidates_by_frame[j]
+                    )
+                    / 6.0
+                )
+            )
             for c in item[1]
         )
     )
@@ -1090,7 +1106,6 @@ async def analyze_video(video: UploadFile = File(...)):
         court_analysis = detect_court(first_frame)
         court_corners = get_court_corners(first_frame)
         court_analysis["corners"] = court_corners
-        court_region, court_region_mode = build_court_region(first_frame, court_corners)
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
