@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.9.0",
+    version="2.0.0",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.9.0",
+        "version": "2.0.0",
     }
 
 
@@ -92,37 +92,23 @@ def detect_court(frame):
 
 
 def build_court_region(frame, court_corners):
-    """Build a court region from detected court geometry only.
+    """Build a colour- and orientation-independent playable court region.
 
-    Public-use requirement:
-      - The phone may be placed anywhere around or inside the court.
-      - The phone may be rotated to any orientation.
-      - Court/floor colour must not be assumed.
-      - The region is derived from the detected four-corner geometry.
-
-    If the detected quadrilateral is not geometrically credible, return it
-    unchanged but mark the mode as ``low_confidence_polygon``. The caller can
-    use this status to tell the user to reposition the phone so more court
-    boundary lines are visible.
+    The normal case is a validated four-corner quadrilateral. When the corner
+    detector returns an implausibly large frame-spanning polygon, do not trust
+    it. Instead, search the visible court-line network for a strong interior
+    boundary and infer which side contains the court. This fallback is
+    orientation-independent and is deliberately conservative.
     """
     if frame is None or not court_corners:
         return court_corners, "court_not_detected"
 
     try:
         if isinstance(court_corners, dict):
-            required = (
-                "top_left",
-                "top_right",
-                "bottom_right",
-                "bottom_left",
-            )
-            if not all(key in court_corners for key in required):
+            keys = ("top_left", "top_right", "bottom_right", "bottom_left")
+            if not all(k in court_corners for k in keys):
                 return court_corners, "invalid_corners"
-
-            pts = np.array(
-                [court_corners[key] for key in required],
-                dtype=np.float32,
-            )
+            pts = np.array([court_corners[k] for k in keys], dtype=np.float32)
         else:
             pts = np.array(list(court_corners), dtype=np.float32)
 
@@ -130,73 +116,173 @@ def build_court_region(frame, court_corners):
             return court_corners, "invalid_corners"
 
         h, w = frame.shape[:2]
-
-        # Reject points far outside the image. A small tolerance is allowed
-        # because line intersections can fall just beyond the visible frame.
-        if (
-            np.any(pts[:, 0] < -0.10 * w)
-            or np.any(pts[:, 0] > 1.10 * w)
-            or np.any(pts[:, 1] < -0.10 * h)
-            or np.any(pts[:, 1] > 1.10 * h)
-        ):
-            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        # Ensure the four points form a convex quadrilateral. No orientation
-        # or colour assumption is used here.
         hull = cv2.convexHull(pts).reshape(-1, 2)
-        if len(hull) != 4:
+        if len(hull) != 4 or not cv2.isContourConvex(hull.reshape(-1, 1, 2)):
             return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
         polygon = hull.astype(np.float32)
+        area_ratio = abs(float(cv2.contourArea(polygon))) / float(max(1, w * h))
 
-        area = abs(float(cv2.contourArea(polygon)))
-        frame_area = float(max(1, w * h))
-        area_ratio = area / frame_area
-
-        # A court occupying only a tiny fraction of the image is unlikely to
-        # provide enough geometry for a reliable public-use line call.
-        if area_ratio < 0.04:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        # Check that every side is visible at a useful scale.
         side_lengths = [
             float(np.linalg.norm(polygon[(i + 1) % 4] - polygon[i]))
             for i in range(4)
         ]
         if min(side_lengths) < max(35.0, min(w, h) * 0.025):
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        # Reject extremely distorted/self-inconsistent quadrilaterals.
         if max(side_lengths) / max(min(side_lengths), 1.0) > 18.0:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        # Opposite court edges should have broadly consistent directions in
-        # perspective. We compare the two pairs without assuming which side
-        # is "left", "right", "top", or "bottom".
         def direction_similarity(a, b):
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
             if na < 1e-6 or nb < 1e-6:
                 return 0.0
             return abs(float(np.dot(a, b) / (na * nb)))
 
-        edge_vectors = [
-            polygon[(i + 1) % 4] - polygon[i]
-            for i in range(4)
-        ]
-        parallel_a = direction_similarity(edge_vectors[0], edge_vectors[2])
-        parallel_b = direction_similarity(edge_vectors[1], edge_vectors[3])
+        ev = [polygon[(i + 1) % 4] - polygon[i] for i in range(4)]
+        parallel_a = direction_similarity(ev[0], ev[2])
+        parallel_b = direction_similarity(ev[1], ev[3])
+        geometry_score = 0.35 * min(1.0, area_ratio / 0.25) + 0.325 * parallel_a + 0.325 * parallel_b
 
-        geometry_score = (
-            0.35 * min(1.0, area_ratio / 0.25)
-            + 0.325 * parallel_a
-            + 0.325 * parallel_b
+        # A moderate, coherent quadrilateral is the preferred solution.
+        # Large frame-spanning polygons need additional line-network evidence.
+        if area_ratio <= 0.50 and geometry_score >= 0.58:
+            return polygon.astype(np.int32).tolist(), "geometry_polygon"
+
+        # ---- Interior-boundary fallback for partial/inside-camera views ----
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.bitwise_or(cv2.Canny(gray, 35, 110), cv2.Canny(gray, 60, 160))
+        raw = cv2.HoughLinesP(
+            edges, 1, np.pi / 180.0, 40,
+            minLineLength=max(45, int(min(w, h) * 0.12)),
+            maxLineGap=35,
         )
 
-        if geometry_score < 0.58:
+        lines = []
+        if raw is not None:
+            for r in raw:
+                vals = np.asarray(r).reshape(-1)
+                if len(vals) < 4:
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in vals[:4]]
+                length = math.hypot(x2 - x1, y2 - y1)
+                if length >= max(45.0, min(w, h) * 0.12):
+                    lines.append((x1, y1, x2, y2, length))
+
+        if not lines:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        return polygon.astype(np.int32).tolist(), "geometry_polygon"
+        diag = math.hypot(w, h)
+        best = None
+
+        for line in lines:
+            x1, y1, x2, y2, length = line
+            p1 = np.array([x1, y1], dtype=np.float32)
+            p2 = np.array([x2, y2], dtype=np.float32)
+            u = (p2 - p1) / max(length, 1e-6)
+            n = np.array([-u[1], u[0]], dtype=np.float32)
+            midpoint = (p1 + p2) * 0.5
+
+            # Do not promote frame-edge structures (walls, crop boundaries,
+            # phone housings) to court boundaries.
+            edge_clearance = min(
+                float(midpoint[0]), float(midpoint[1]),
+                float(w - midpoint[0]), float(h - midpoint[1])
+            )
+            if edge_clearance < min(w, h) * 0.055:
+                continue
+
+            side_length = [0.0, 0.0]
+            perpendicular_count = [0, 0]
+            perpendicular_length_sum = [0.0, 0.0]
+
+            candidate_dict = {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2
+            }
+
+            for other in lines:
+                if other is line:
+                    continue
+                ox1, oy1, ox2, oy2, olen = other
+                ov = np.array([ox2 - ox1, oy2 - oy1], dtype=np.float32)
+                on = np.linalg.norm(ov)
+                if on < 1e-6:
+                    continue
+                # Perpendicular court lines should cross the boundary or come
+                # very close to it. This is stronger evidence than raw density.
+                if abs(float(np.dot(ov / on, u))) > 0.45:
+                    continue
+
+                other_dict = {
+                    "x1": ox1, "y1": oy1, "x2": ox2, "y2": oy2
+                }
+                intersection = None
+                try:
+                    intersection = line_intersection(candidate_dict, other_dict)
+                except Exception:
+                    pass
+
+                if intersection is None:
+                    continue
+
+                ip = np.array(intersection, dtype=np.float32)
+                along = float(np.dot(ip - p1, u))
+                other_along = float(np.dot(ip - np.array([ox1, oy1], dtype=np.float32), ov / on))
+                if not (-35.0 <= along <= length + 35.0):
+                    continue
+                if not (-35.0 <= other_along <= olen + 35.0):
+                    continue
+
+                # Determine which side of the candidate contains the crossing.
+                signed = float(np.dot(ip - midpoint, n))
+                side = 0 if signed >= 0 else 1
+                side_length[side] += min(olen, min(w, h) * 0.75)
+                perpendicular_length_sum[side] += min(olen, min(w, h) * 0.75)
+                perpendicular_count[side] += 1
+
+            total = side_length[0] + side_length[1]
+            if total < 180.0:
+                continue
+
+            richer = 0 if side_length[0] >= side_length[1] else 1
+            poorer = 1 - richer
+            imbalance = (side_length[richer] - side_length[poorer]) / max(total, 1.0)
+            crossing_support = min(1.0, perpendicular_count[richer] / 3.0)
+            length_support = min(1.0, length / max(min(w, h) * 0.60, 1.0))
+            centrality = min(1.0, edge_clearance / max(min(w, h) * 0.30, 1.0))
+            avg_perp = perpendicular_length_sum[richer] / max(perpendicular_count[richer], 1)
+            dimension_ratio = length / max(avg_perp, 1.0)
+            dimension_score = min(1.0, max(0.0, (dimension_ratio - 0.85) / 0.55))
+
+            # A court boundary should be a substantial line with several
+            # perpendicular court lines meeting it, with a clearly richer
+            # playable side. No colour or orientation assumption is used.
+            score = (
+                0.35 * imbalance
+                + 0.35 * crossing_support
+                + 0.20 * length_support
+                + 0.10 * centrality
+            )
+
+            if best is None or score > best[0]:
+                best = (score, line, n, richer, side_length, perpendicular_count)
+
+        if best is None or best[0] < 0.28:
+            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        _, line, normal, richer, side_length, crossing_count = best
+        p1 = np.array([line[0], line[1]], dtype=np.float32)
+        p2 = np.array([line[2], line[3]], dtype=np.float32)
+        tangent = (p2 - p1) / max(line[4], 1e-6)
+        chosen_normal = normal if richer == 0 else -normal
+        extension = diag * 2.0
+        a = p1 - tangent * extension
+        b = p2 + tangent * extension
+        c = b + chosen_normal * extension
+        d = a + chosen_normal * extension
+        region = np.array([a, b, c, d], dtype=np.float32)
+
+        return region.astype(np.int32).tolist(), "visible_side_region"
 
     except Exception:
         return court_corners, "low_confidence_polygon"
@@ -623,12 +709,12 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
 def track_shuttle(frame_candidates_by_frame):
     """
-    Bidirectional trajectory tracking.
+    Bidirectional trajectory tracking with multi-seed temporal validation.
 
-    The old tracker only searched forward from one candidate. That could
-    produce one-point tracks when the strongest candidate appeared late in a
-    clip. This tracker searches both directions and selects the strongest
-    continuous path.
+    Instead of choosing only the strongest candidate frame, test strong
+    candidates from across the clip. This prevents a late false detection
+    from becoming the entire trajectory when an earlier, longer trajectory
+    is available.
     """
     usable = [
         (i, candidates)
@@ -638,23 +724,54 @@ def track_shuttle(frame_candidates_by_frame):
     if not usable:
         return [], 0.0
 
-    seed_frame, seed_candidates = max(
-        usable,
-        key=lambda item: max(
-            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
-            for c in item[1]
+    def candidate_strength(candidate):
+        return float(
+            candidate.get("score", 0.0)
+            * (0.55 + 1.45 * candidate.get("motion_ratio", 0.0))
         )
-    )
-    seed_candidates = sorted(
-        seed_candidates,
-        key=lambda c: c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0)),
-        reverse=True,
-    )[:8]
+
+    # Build seed hypotheses across the whole clip, not just one frame.
+    # A real shuttle should be supported by a continuous sequence of
+    # detections, while an accidental bright object is often isolated.
+    seed_pool = []
+    for frame_no, candidates in usable:
+        ranked = sorted(candidates, key=candidate_strength, reverse=True)[:3]
+        for candidate in ranked:
+            nearby = 0
+            for j in range(max(0, frame_no - 2), min(len(frame_candidates_by_frame), frame_no + 3)):
+                if j != frame_no and frame_candidates_by_frame[j]:
+                    nearby += 1
+            support = 1.0 + 0.20 * (nearby / 4.0)
+            seed_pool.append((candidate_strength(candidate) * support, frame_no, candidate))
+
+    seed_pool.sort(key=lambda item: item[0], reverse=True)
+
+    # Keep seeds distributed through time so one late false detection cannot
+    # dominate all hypotheses. At most 24 seeds are evaluated.
+    selected_seeds = []
+    used_frames = []
+    for strength, frame_no, candidate in seed_pool:
+        if any(abs(frame_no - f) < 4 for f in used_frames):
+            continue
+        selected_seeds.append((frame_no, candidate))
+        used_frames.append(frame_no)
+        if len(selected_seeds) >= 24:
+            break
+
+    # If temporal spacing filtered too aggressively, fill from remaining
+    # strongest candidates.
+    if len(selected_seeds) < 8:
+        for _, frame_no, candidate in seed_pool:
+            if (frame_no, candidate) in selected_seeds:
+                continue
+            selected_seeds.append((frame_no, candidate))
+            if len(selected_seeds) >= 8:
+                break
 
     best_path = []
     best_quality = -1e9
 
-    for seed in seed_candidates:
+    for seed_frame, seed in selected_seeds:
         backward = _track_one_direction(
             frame_candidates_by_frame,
             seed_frame,
@@ -672,26 +789,38 @@ def track_shuttle(frame_candidates_by_frame):
         path.sort(key=lambda p: p["frame"])
 
         if len(path) < 2:
-            quality = seed["score"]
-        else:
-            jumps = []
-            for a, b in zip(path[:-1], path[1:]):
-                gap = max(1, b["frame"] - a["frame"])
-                jumps.append(
-                    math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-                    / (700.0 * gap)
-                )
-            smoothness = 1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0)))
-            length_score = min(1.0, len(path) / 10.0)
-            x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
-            y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
-            movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
-            quality = (
-                0.35 * smoothness
-                + 0.30 * length_score
-                + 0.20 * movement_score
-                + 0.15 * seed["score"]
+            continue
+
+        jumps = []
+        for a, b in zip(path[:-1], path[1:]):
+            gap = max(1, b["frame"] - a["frame"])
+            jumps.append(
+                math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+                / (700.0 * gap)
             )
+
+        smoothness = max(
+            0.0,
+            1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0))),
+        )
+        length_score = min(1.0, len(path) / 10.0)
+        x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
+        y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
+        movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
+
+        # Strongly favor trajectories supported by multiple frames. A short
+        # isolated 3-4 point false track should lose to a longer continuous
+        # shuttle track even if its seed candidate is visually strong.
+        quality = (
+            0.50 * length_score
+            + 0.25 * smoothness
+            + 0.20 * movement_score
+            + 0.05 * seed["score"]
+        )
+        if len(path) < 5:
+            quality -= 0.20
+        if len(path) < 4:
+            quality -= 0.20
 
         if quality > best_quality:
             best_quality = quality
@@ -717,7 +846,6 @@ def track_shuttle(frame_candidates_by_frame):
     y_span = max(p["y"] for p in best_path) - min(p["y"] for p in best_path)
     movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
 
-    # Require meaningful spatial movement before reporting a confident track.
     if movement_score < 0.20:
         return best_path, 0.0
 
@@ -785,7 +913,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 1.9 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 2.0 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -992,7 +1120,7 @@ async def debug_video(video: UploadFile = File(...)):
             frame_candidates_by_frame
         )
         landing_point = (
-            choose_landing_point(trajectory, fps, court_corners)
+            choose_landing_point(trajectory, fps, court_region)
             if len(trajectory) >= 3
             else None
         )
@@ -1167,7 +1295,7 @@ async def analyze_video(video: UploadFile = File(...)):
         shuttle_detected = len(trajectory) >= 3
 
         estimated_landing_point = (
-            choose_landing_point(trajectory, fps, court_corners)
+            choose_landing_point(trajectory, fps, court_region)
             if shuttle_detected
             else None
         )
