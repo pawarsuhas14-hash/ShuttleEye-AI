@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -89,6 +89,91 @@ def detect_court(frame):
         "court_lines_detected": len(detected_lines),
         "lines": detected_lines[:40],
     }
+
+
+def build_court_region(frame, court_corners):
+    """Choose the visible playable side of the detected court boundary.
+
+    The Hough corner detector can sometimes build a quadrilateral on the
+    wrong side of the visible sideline.  We compare court-line density on
+    both sides of the detector's left edge.  If the richer court-line side
+    is outside the detected quadrilateral, use that visible side as the
+    playable region.
+    """
+    if frame is None or not court_corners:
+        return court_corners, "detected_polygon"
+
+    try:
+        if isinstance(court_corners, dict):
+            pts = np.array([
+                court_corners["top_left"],
+                court_corners["top_right"],
+                court_corners["bottom_right"],
+                court_corners["bottom_left"],
+            ], dtype=np.float32)
+        else:
+            pts = np.array(list(court_corners), dtype=np.float32)
+
+        if pts.shape != (4, 2):
+            return court_corners, "detected_polygon"
+
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white = ((gray > 155) & (hsv[:, :, 1] < 170)).astype(np.uint8)
+
+        a = pts[0]  # top-left
+        b = pts[3]  # bottom-left: likely visible sideline
+        edge = b - a
+        length = float(np.linalg.norm(edge))
+        if length < 100:
+            return court_corners, "detected_polygon"
+
+        tangent = edge / length
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+
+        # Sample line density on both sides of the sideline, avoiding the
+        # sideline itself.  Use a central portion to reduce wall/floor noise.
+        inside_score = 0.0
+        outside_score = 0.0
+        samples = 0
+        for t in np.linspace(0.12, 0.88, 18):
+            base = a + edge * float(t)
+            for d in (35.0, 65.0, 95.0):
+                for sign, accum in ((1.0, "inside"), (-1.0, "outside")):
+                    p = base + normal * (sign * d)
+                    cx, cy = int(round(float(p[0]))), int(round(float(p[1])))
+                    if 0 <= cx < w and 0 <= cy < h:
+                        x0, x1 = max(0, cx - 12), min(w, cx + 13)
+                        y0, y1 = max(0, cy - 12), min(h, cy + 13)
+                        density = float(np.mean(white[y0:y1, x0:x1]))
+                        if accum == "inside":
+                            inside_score += density
+                        else:
+                            outside_score += density
+                        samples += 1
+
+        if samples == 0:
+            return court_corners, "detected_polygon"
+
+        # 'inside' is the +normal side of the left edge.  If the opposite
+        # side has substantially more court-line structure, the polygon is
+        # likely on the wrong side.
+        if outside_score > inside_score * 1.35 and outside_score > 1.5:
+            # Build the visible court region between the sideline and the
+            # image's left edge, using the detected top/bottom intersections.
+            region = np.array([
+                [0, int(round(a[1]))],
+                [int(round(a[0])), int(round(a[1]))],
+                [int(round(b[0])), int(round(b[1]))],
+                [0, int(round(b[1]))],
+            ], dtype=np.int32)
+            return region.tolist(), "visible_left_side"
+
+        return pts.astype(np.int32).tolist(), "detected_polygon"
+
+    except Exception:
+        return court_corners, "detected_polygon"
 
 
 def check_landing_inside_court(landing_point, court_corners, margin=0):
@@ -674,7 +759,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 1.7 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 1.8 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -852,6 +937,7 @@ async def debug_video(video: UploadFile = File(...)):
 
         court_analysis = detect_court(first_frame)
         court_corners = get_court_corners(first_frame)
+        court_region, court_region_mode = build_court_region(first_frame, court_corners)
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -886,7 +972,7 @@ async def debug_video(video: UploadFile = File(...)):
         )
         decision = check_landing_inside_court(
             landing_point,
-            court_corners,
+            court_region,
         )
 
         # Use the landing frame when available; otherwise show the final
@@ -909,7 +995,7 @@ async def debug_video(video: UploadFile = File(...)):
         debug_frame = create_debug_frame(
             debug_frame,
             trajectory,
-            court_corners,
+            court_region,
             landing_point,
             decision,
         )
@@ -1054,7 +1140,7 @@ async def analyze_video(video: UploadFile = File(...)):
 
         landing_decision = check_landing_inside_court(
             estimated_landing_point,
-            court_corners,
+            court_region,
         )
 
         motion_percentage = (
@@ -1094,6 +1180,8 @@ async def analyze_video(video: UploadFile = File(...)):
                     court_analysis.get("court_lines_detected", 0)
                 ),
                 "corners": court_corners,
+                "playable_region": court_region,
+                "region_mode": court_region_mode,
             },
             "shuttle_detection": {
                 "shuttle_detected": bool(shuttle_detected),
