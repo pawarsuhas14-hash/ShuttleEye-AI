@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 
@@ -94,11 +94,11 @@ def detect_court(frame):
 def build_court_region(frame, court_corners):
     """Build a colour- and orientation-independent playable court region.
 
-    The normal case is a validated four-corner quadrilateral. When the corner
-    detector returns an implausibly large frame-spanning polygon, do not trust
-    it. Instead, search the visible court-line network for a strong interior
-    boundary and infer which side contains the court. This fallback is
-    orientation-independent and is deliberately conservative.
+    A four-corner polygon is accepted only when its geometry is coherent.
+    For partial views, fall back to a detected *boundary line* supported by
+    multiple perpendicular court lines.  The fallback uses line support and
+    termination geometry rather than assuming left/right, portrait/landscape,
+    or a particular court colour.
     """
     if frame is None or not court_corners:
         return court_corners, "court_not_detected"
@@ -117,38 +117,24 @@ def build_court_region(frame, court_corners):
 
         h, w = frame.shape[:2]
         hull = cv2.convexHull(pts).reshape(-1, 2)
-        if len(hull) != 4 or not cv2.isContourConvex(hull.reshape(-1, 1, 2)):
-            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
+        if len(hull) == 4 and cv2.isContourConvex(hull.reshape(-1, 1, 2)):
+            polygon = hull.astype(np.float32)
+            area_ratio = abs(float(cv2.contourArea(polygon))) / float(max(1, w * h))
+            side_lengths = [float(np.linalg.norm(polygon[(i + 1) % 4] - polygon[i])) for i in range(4)]
+            if min(side_lengths) >= max(35.0, min(w, h) * 0.025) and max(side_lengths) / max(min(side_lengths), 1.0) <= 18.0:
+                def direction_similarity(a, b):
+                    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+                    if na < 1e-6 or nb < 1e-6:
+                        return 0.0
+                    return abs(float(np.dot(a, b) / (na * nb)))
+                ev = [polygon[(i + 1) % 4] - polygon[i] for i in range(4)]
+                pa = direction_similarity(ev[0], ev[2])
+                pb = direction_similarity(ev[1], ev[3])
+                geometry_score = 0.35 * min(1.0, area_ratio / 0.25) + 0.325 * pa + 0.325 * pb
+                if area_ratio <= 0.50 and geometry_score >= 0.58:
+                    return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
-        polygon = hull.astype(np.float32)
-        area_ratio = abs(float(cv2.contourArea(polygon))) / float(max(1, w * h))
-
-        side_lengths = [
-            float(np.linalg.norm(polygon[(i + 1) % 4] - polygon[i]))
-            for i in range(4)
-        ]
-        if min(side_lengths) < max(35.0, min(w, h) * 0.025):
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-        if max(side_lengths) / max(min(side_lengths), 1.0) > 18.0:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        def direction_similarity(a, b):
-            na, nb = np.linalg.norm(a), np.linalg.norm(b)
-            if na < 1e-6 or nb < 1e-6:
-                return 0.0
-            return abs(float(np.dot(a, b) / (na * nb)))
-
-        ev = [polygon[(i + 1) % 4] - polygon[i] for i in range(4)]
-        parallel_a = direction_similarity(ev[0], ev[2])
-        parallel_b = direction_similarity(ev[1], ev[3])
-        geometry_score = 0.35 * min(1.0, area_ratio / 0.25) + 0.325 * parallel_a + 0.325 * parallel_b
-
-        # A moderate, coherent quadrilateral is the preferred solution.
-        # Large frame-spanning polygons need additional line-network evidence.
-        if area_ratio <= 0.50 and geometry_score >= 0.58:
-            return polygon.astype(np.int32).tolist(), "geometry_polygon"
-
-        # ---- Interior-boundary fallback for partial/inside-camera views ----
+        # ---- Boundary-line fallback ----
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.bitwise_or(cv2.Canny(gray, 35, 110), cv2.Canny(gray, 60, 160))
@@ -157,131 +143,209 @@ def build_court_region(frame, court_corners):
             minLineLength=max(45, int(min(w, h) * 0.12)),
             maxLineGap=35,
         )
+        if raw is None:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        lines = []
-        if raw is not None:
-            for r in raw:
-                vals = np.asarray(r).reshape(-1)
-                if len(vals) < 4:
-                    continue
-                x1, y1, x2, y2 = [float(v) for v in vals[:4]]
-                length = math.hypot(x2 - x1, y2 - y1)
-                if length >= max(45.0, min(w, h) * 0.12):
-                    lines.append((x1, y1, x2, y2, length))
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white_mask = (hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 100)
 
-        if not lines:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+        def line_support(p1, p2):
+            length = float(np.linalg.norm(p2 - p1))
+            n = max(24, int(length / 4.0))
+            xs = np.linspace(p1[0], p2[0], n)
+            ys = np.linspace(p1[1], p2[1], n)
+            u = (p2 - p1) / max(length, 1e-6)
+            normal = np.array([-u[1], u[0]], dtype=np.float32)
+            vals = []
+            for off in range(-4, 5):
+                xx = np.clip(np.rint(xs + normal[0] * off).astype(int), 0, w - 1)
+                yy = np.clip(np.rint(ys + normal[1] * off).astype(int), 0, h - 1)
+                vals.extend(white_mask[yy, xx])
+            return float(np.mean(vals))
 
-        diag = math.hypot(w, h)
-        best = None
-
-        for line in lines:
-            x1, y1, x2, y2, length = line
+        raw_lines = []
+        for r in raw:
+            vals = np.asarray(r).reshape(-1)
+            if len(vals) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in vals[:4]]
             p1 = np.array([x1, y1], dtype=np.float32)
             p2 = np.array([x2, y2], dtype=np.float32)
-            u = (p2 - p1) / max(length, 1e-6)
+            length = float(np.linalg.norm(p2 - p1))
+            if length < max(45.0, min(w, h) * 0.12):
+                continue
+            angle = math.atan2(y2 - y1, x2 - x1)
+            if angle < 0:
+                angle += math.pi
+            u = np.array([math.cos(angle), math.sin(angle)], dtype=np.float32)
             n = np.array([-u[1], u[0]], dtype=np.float32)
-            midpoint = (p1 + p2) * 0.5
+            rho = float(np.dot(n, p1))
+            if rho < 0:
+                rho = -rho
+                u = -u
+                n = -n
+            raw_lines.append({"u": u, "n": n, "rho": rho, "p1": p1, "p2": p2,
+                              "lo": min(float(np.dot(u, p1)), float(np.dot(u, p2))),
+                              "hi": max(float(np.dot(u, p1)), float(np.dot(u, p2))),
+                              "length": length, "support": line_support(p1, p2)})
 
-            # Do not promote frame-edge structures (walls, crop boundaries,
-            # phone housings) to court boundaries.
-            edge_clearance = min(
-                float(midpoint[0]), float(midpoint[1]),
-                float(w - midpoint[0]), float(h - midpoint[1])
-            )
-            if edge_clearance < min(w, h) * 0.055:
+        if not raw_lines:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        # Merge fragmented detections belonging to the same physical line.
+        merged = []
+        for item in sorted(raw_lines, key=lambda z: z["length"], reverse=True):
+            hit = None
+            for m in merged:
+                da = abs(math.atan2(float(np.cross(m["u"], item["u"])), float(np.dot(m["u"], item["u"]))))
+                if da > math.radians(5.0):
+                    continue
+                if abs(item["rho"] - m["rho"]) > 14.0:
+                    continue
+                lo = item["lo"]; hi = item["hi"]
+                gap = max(0.0, m["lo"] - hi, lo - m["hi"])
+                if gap > min(w, h) * 0.45:
+                    continue
+                hit = m
+                break
+            if hit is None:
+                merged.append(dict(item, support_weight=item["support"] * item["length"]))
+            else:
+                hit["lo"] = min(hit["lo"], item["lo"], item["hi"])
+                hit["hi"] = max(hit["hi"], item["lo"], item["hi"])
+                hit["support_weight"] += item["support"] * item["length"]
+                hit["length"] = hit["hi"] - hit["lo"]
+
+        def line_points(m):
+            p1 = m["u"] * m["lo"] + m["n"] * m["rho"]
+            p2 = m["u"] * m["hi"] + m["n"] * m["rho"]
+            return p1, p2
+
+        for m in merged:
+            m["support"] = min(1.0, m["support_weight"] / max(m["length"], 1.0))
+
+        candidates = []
+        for i, m in enumerate(merged):
+            if m["length"] < max(90.0, min(w, h) * 0.18) or m["support"] < 0.18:
+                continue
+            p1, p2 = line_points(m)
+            u, n = m["u"], m["n"]
+            terminating = [[], []]
+            nearby = [[], []]
+            for j, other in enumerate(merged):
+                if i == j or abs(float(np.dot(u, other["u"]))) > 0.45:
+                    continue
+                q1, q2 = line_points(other)
+                d1 = abs(float(np.cross(u, q1 - p1)))
+                d2 = abs(float(np.cross(u, q2 - p1)))
+                if min(d1, d2) > 80.0:
+                    continue
+                proj = [float(np.dot(q1 - p1, u)), float(np.dot(q2 - p1, u))]
+                if max(proj) < -120.0 or min(proj) > m["length"] + 120.0:
+                    continue
+                om = (q1 + q2) * 0.5
+                signed = float(np.dot(n, om - p1))
+                if abs(signed) < 12.0:
+                    continue
+                side = 0 if signed > 0 else 1
+                nearby[side].append(other)
+
+                near, far = (q1, q2) if d1 <= d2 else (q2, q1)
+                s_near = float(np.dot(n, near - p1))
+                s_far = float(np.dot(n, far - p1))
+                if abs(s_far) >= 45.0 and s_near * s_far > 0:
+                    terminating[side].append(other)
+
+            # The playable side should contain a small, coherent family of
+            # bright perpendicular lines. This rejects wall/sign grids while
+            # remaining independent of orientation and court colour.
+            side_metrics = []
+            for side in (0, 1):
+                family = nearby[side]
+                if len(family) < 2:
+                    side_metrics.append((0, 0.0, 0.0, 0.0))
+                    continue
+                offsets = []
+                weighted_support = 0.0
+                weight_total = 0.0
+                for o in family:
+                    q1, q2 = line_points(o)
+                    off = float(np.dot(n, ((q1 + q2) * 0.5) - p1))
+                    offsets.append(off)
+                    wt = min(o["length"], 350.0)
+                    weighted_support += min(1.0, o["support"]) * wt
+                    weight_total += wt
+                spread = max(offsets) - min(offsets)
+                avg_support = weighted_support / max(weight_total, 1.0)
+                term_count = sum(1 for o in terminating[side] if o["support"] >= 0.05)
+                side_metrics.append((len(family), spread, avg_support, term_count))
+
+            # Prefer a side with at least two perpendicular lines spread over
+            # a substantial fraction of the image and with visible line support.
+            best_side = max((0, 1), key=lambda k: (
+                side_metrics[k][2],
+                side_metrics[k][1],
+                side_metrics[k][0],
+            ))
+            count, spread, avg_support, term_count = side_metrics[best_side]
+            if count < 2 or spread < min(w, h) * 0.20 or avg_support < 0.16:
                 continue
 
-            side_length = [0.0, 0.0]
-            perpendicular_count = [0, 0]
-            perpendicular_length_sum = [0.0, 0.0]
-
-            candidate_dict = {
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2
-            }
-
-            for other in lines:
-                if other is line:
-                    continue
-                ox1, oy1, ox2, oy2, olen = other
-                ov = np.array([ox2 - ox1, oy2 - oy1], dtype=np.float32)
-                on = np.linalg.norm(ov)
-                if on < 1e-6:
-                    continue
-                # Perpendicular court lines should cross the boundary or come
-                # very close to it. This is stronger evidence than raw density.
-                if abs(float(np.dot(ov / on, u))) > 0.45:
-                    continue
-
-                other_dict = {
-                    "x1": ox1, "y1": oy1, "x2": ox2, "y2": oy2
-                }
-                intersection = None
-                try:
-                    intersection = line_intersection(candidate_dict, other_dict)
-                except Exception:
-                    pass
-
-                if intersection is None:
-                    continue
-
-                ip = np.array(intersection, dtype=np.float32)
-                along = float(np.dot(ip - p1, u))
-                other_along = float(np.dot(ip - np.array([ox1, oy1], dtype=np.float32), ov / on))
-                if not (-35.0 <= along <= length + 35.0):
-                    continue
-                if not (-35.0 <= other_along <= olen + 35.0):
-                    continue
-
-                # Determine which side of the candidate contains the crossing.
-                signed = float(np.dot(ip - midpoint, n))
-                side = 0 if signed >= 0 else 1
-                side_length[side] += min(olen, min(w, h) * 0.75)
-                perpendicular_length_sum[side] += min(olen, min(w, h) * 0.75)
-                perpendicular_count[side] += 1
-
-            total = side_length[0] + side_length[1]
-            if total < 180.0:
-                continue
-
-            richer = 0 if side_length[0] >= side_length[1] else 1
-            poorer = 1 - richer
-            imbalance = (side_length[richer] - side_length[poorer]) / max(total, 1.0)
-            crossing_support = min(1.0, perpendicular_count[richer] / 3.0)
-            length_support = min(1.0, length / max(min(w, h) * 0.60, 1.0))
-            centrality = min(1.0, edge_clearance / max(min(w, h) * 0.30, 1.0))
-            avg_perp = perpendicular_length_sum[richer] / max(perpendicular_count[richer], 1)
-            dimension_ratio = length / max(avg_perp, 1.0)
-            dimension_score = min(1.0, max(0.0, (dimension_ratio - 0.85) / 0.55))
-
-            # A court boundary should be a substantial line with several
-            # perpendicular court lines meeting it, with a clearly richer
-            # playable side. No colour or orientation assumption is used.
             score = (
-                0.35 * imbalance
-                + 0.35 * crossing_support
-                + 0.20 * length_support
-                + 0.10 * centrality
+                0.28 * m["support"]
+                + 0.18 * min(1.0, m["length"] / 450.0)
+                + 0.20 * min(1.0, count / 3.0)
+                + 0.18 * min(1.0, spread / (min(w, h) * 0.45))
+                + 0.16 * min(1.0, avg_support / 0.55)
             )
+            # Termination is useful extra evidence but not mandatory because
+            # perspective/Hough fragmentation can turn a crossing into a
+            # near-endpoint detection.
+            score += 0.05 * min(1.0, term_count / 2.0)
+            candidates.append((score, m, best_side, count, spread, avg_support))
 
-            if best is None or score > best[0]:
-                best = (score, line, n, richer, side_length, perpendicular_count)
+        if not candidates:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        if best is None or best[0] < 0.28:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best, rich, rich_count, spread, avg_support = candidates[0]
+        if best_score < 0.50 or rich_count < 2:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        _, line, normal, richer, side_length, crossing_count = best
-        p1 = np.array([line[0], line[1]], dtype=np.float32)
-        p2 = np.array([line[2], line[3]], dtype=np.float32)
-        tangent = (p2 - p1) / max(line[4], 1e-6)
-        chosen_normal = normal if richer == 0 else -normal
-        extension = diag * 2.0
-        a = p1 - tangent * extension
-        b = p2 + tangent * extension
-        c = b + chosen_normal * extension
-        d = a + chosen_normal * extension
+        p1, p2 = line_points(best)
+        tangent = best["u"]
+        inward = best["n"] if rich == 0 else -best["n"]
+
+        # Find the two outermost perpendicular court lines on the inferred
+        # playable side. Their band gives us the visible court depth.
+        cross_lines = []
+        for other in merged:
+            if other is best or abs(float(np.dot(tangent, other["u"]))) > 0.45:
+                continue
+            q1, q2 = line_points(other)
+            if min(abs(float(np.cross(tangent, q1 - p1))), abs(float(np.cross(tangent, q2 - p1)))) > 80.0:
+                continue
+            om = (q1 + q2) * 0.5
+            off = float(np.dot(inward, om - p1))
+            if off <= 12.0:
+                continue
+            cross_lines.append((off, other))
+        if len(cross_lines) < 2:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
+        cross_lines.sort(key=lambda z: z[0])
+        near_off = cross_lines[0][0]
+        far_off = cross_lines[-1][0]
+        if far_off - near_off < min(w, h) * 0.20:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        # The region is the intersection of the boundary half-plane and the
+        # band between the two outer court lines, extended to the image frame.
+        extension = math.hypot(w, h) * 2.0
+        a = p1 - tangent * extension + inward * near_off
+        b = p2 + tangent * extension + inward * near_off
+        c = p2 + tangent * extension + inward * far_off
+        d = p1 - tangent * extension + inward * far_off
         region = np.array([a, b, c, d], dtype=np.float32)
-
         return region.astype(np.int32).tolist(), "visible_side_region"
 
     except Exception:
@@ -386,8 +450,6 @@ def _candidate_score(gray, hsv, contour, x, y, w, h, area):
         + 0.06 * shape_score
     )
     return float(score), appearance_ratio, yellow_ratio, circularity
-
-
 
 def build_static_line_mask(frame, court_analysis):
     """Build a mask of strong static court lines from the first frame."""
@@ -913,7 +975,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 2.0 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 2.1 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -1128,6 +1190,14 @@ async def debug_video(video: UploadFile = File(...)):
             landing_point,
             court_region,
         )
+        if court_region_mode in {"court_not_detected", "invalid_corners", "low_confidence_polygon"}:
+            decision = {
+                "result": "UNKNOWN",
+                "inside": None,
+                "boundary_distance_pixels": None,
+                "message": "Court geometry is not reliable enough for an IN/OUT call",
+                "confidence": 0.0,
+            }
 
         # Use the landing frame when available; otherwise show the final
         # tracked frame so we can inspect exactly what the tracker followed.
