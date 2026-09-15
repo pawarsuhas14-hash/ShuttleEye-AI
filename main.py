@@ -615,23 +615,7 @@ def track_shuttle(frame_candidates_by_frame):
     seed_frame, seed_candidates = max(
         usable,
         key=lambda item: max(
-            (
-                c["score"]
-                * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
-                * (
-                    1.0
-                    + 0.35
-                    * sum(
-                        1
-                        for j in range(
-                            max(0, item[0] - 3),
-                            min(len(frame_candidates_by_frame), item[0] + 4),
-                        )
-                        if j != item[0] and frame_candidates_by_frame[j]
-                    )
-                    / 6.0
-                )
-            )
+            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
             for c in item[1]
         )
     )
