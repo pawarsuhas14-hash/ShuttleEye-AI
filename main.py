@@ -1090,6 +1090,7 @@ async def analyze_video(video: UploadFile = File(...)):
         court_analysis = detect_court(first_frame)
         court_corners = get_court_corners(first_frame)
         court_analysis["corners"] = court_corners
+        court_region, court_region_mode = build_court_region(first_frame, court_corners)
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
