@@ -597,12 +597,12 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
 def track_shuttle(frame_candidates_by_frame):
     """
-    Bidirectional trajectory tracking.
+    Bidirectional trajectory tracking with multi-seed temporal validation.
 
-    The old tracker only searched forward from one candidate. That could
-    produce one-point tracks when the strongest candidate appeared late in a
-    clip. This tracker searches both directions and selects the strongest
-    continuous path.
+    Instead of choosing only the strongest candidate frame, test strong
+    candidates from across the clip. This prevents a late false detection
+    from becoming the entire trajectory when an earlier, longer trajectory
+    is available.
     """
     usable = [
         (i, candidates)
@@ -612,23 +612,54 @@ def track_shuttle(frame_candidates_by_frame):
     if not usable:
         return [], 0.0
 
-    seed_frame, seed_candidates = max(
-        usable,
-        key=lambda item: max(
-            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
-            for c in item[1]
+    def candidate_strength(candidate):
+        return float(
+            candidate.get("score", 0.0)
+            * (0.55 + 1.45 * candidate.get("motion_ratio", 0.0))
         )
-    )
-    seed_candidates = sorted(
-        seed_candidates,
-        key=lambda c: c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0)),
-        reverse=True,
-    )[:8]
+
+    # Build seed hypotheses across the whole clip, not just one frame.
+    # A real shuttle should be supported by a continuous sequence of
+    # detections, while an accidental bright object is often isolated.
+    seed_pool = []
+    for frame_no, candidates in usable:
+        ranked = sorted(candidates, key=candidate_strength, reverse=True)[:3]
+        for candidate in ranked:
+            nearby = 0
+            for j in range(max(0, frame_no - 2), min(len(frame_candidates_by_frame), frame_no + 3)):
+                if j != frame_no and frame_candidates_by_frame[j]:
+                    nearby += 1
+            support = 1.0 + 0.20 * (nearby / 4.0)
+            seed_pool.append((candidate_strength(candidate) * support, frame_no, candidate))
+
+    seed_pool.sort(key=lambda item: item[0], reverse=True)
+
+    # Keep seeds distributed through time so one late false detection cannot
+    # dominate all hypotheses. At most 24 seeds are evaluated.
+    selected_seeds = []
+    used_frames = []
+    for strength, frame_no, candidate in seed_pool:
+        if any(abs(frame_no - f) < 4 for f in used_frames):
+            continue
+        selected_seeds.append((frame_no, candidate))
+        used_frames.append(frame_no)
+        if len(selected_seeds) >= 24:
+            break
+
+    # If temporal spacing filtered too aggressively, fill from remaining
+    # strongest candidates.
+    if len(selected_seeds) < 8:
+        for _, frame_no, candidate in seed_pool:
+            if (frame_no, candidate) in selected_seeds:
+                continue
+            selected_seeds.append((frame_no, candidate))
+            if len(selected_seeds) >= 8:
+                break
 
     best_path = []
     best_quality = -1e9
 
-    for seed in seed_candidates:
+    for seed_frame, seed in selected_seeds:
         backward = _track_one_direction(
             frame_candidates_by_frame,
             seed_frame,
@@ -646,26 +677,38 @@ def track_shuttle(frame_candidates_by_frame):
         path.sort(key=lambda p: p["frame"])
 
         if len(path) < 2:
-            quality = seed["score"]
-        else:
-            jumps = []
-            for a, b in zip(path[:-1], path[1:]):
-                gap = max(1, b["frame"] - a["frame"])
-                jumps.append(
-                    math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-                    / (700.0 * gap)
-                )
-            smoothness = 1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0)))
-            length_score = min(1.0, len(path) / 10.0)
-            x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
-            y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
-            movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
-            quality = (
-                0.35 * smoothness
-                + 0.30 * length_score
-                + 0.20 * movement_score
-                + 0.15 * seed["score"]
+            continue
+
+        jumps = []
+        for a, b in zip(path[:-1], path[1:]):
+            gap = max(1, b["frame"] - a["frame"])
+            jumps.append(
+                math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+                / (700.0 * gap)
             )
+
+        smoothness = max(
+            0.0,
+            1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0))),
+        )
+        length_score = min(1.0, len(path) / 10.0)
+        x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
+        y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
+        movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
+
+        # Strongly favor trajectories supported by multiple frames. A short
+        # isolated 3-4 point false track should lose to a longer continuous
+        # shuttle track even if its seed candidate is visually strong.
+        quality = (
+            0.50 * length_score
+            + 0.25 * smoothness
+            + 0.20 * movement_score
+            + 0.05 * seed["score"]
+        )
+        if len(path) < 5:
+            quality -= 0.20
+        if len(path) < 4:
+            quality -= 0.20
 
         if quality > best_quality:
             best_quality = quality
@@ -691,7 +734,6 @@ def track_shuttle(frame_candidates_by_frame):
     y_span = max(p["y"] for p in best_path) - min(p["y"] for p in best_path)
     movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
 
-    # Require meaningful spatial movement before reporting a confident track.
     if movement_score < 0.20:
         return best_path, 0.0
 
