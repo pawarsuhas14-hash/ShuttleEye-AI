@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "1.6.1",
+        "version": "1.9.0",
     }
 
 
@@ -92,88 +92,114 @@ def detect_court(frame):
 
 
 def build_court_region(frame, court_corners):
-    """Choose the visible playable side of the detected court boundary.
+    """Build a court region from detected court geometry only.
 
-    The Hough corner detector can sometimes build a quadrilateral on the
-    wrong side of the visible sideline.  We compare court-line density on
-    both sides of the detector's left edge.  If the richer court-line side
-    is outside the detected quadrilateral, use that visible side as the
-    playable region.
+    Public-use requirement:
+      - The phone may be placed anywhere around or inside the court.
+      - The phone may be rotated to any orientation.
+      - Court/floor colour must not be assumed.
+      - The region is derived from the detected four-corner geometry.
+
+    If the detected quadrilateral is not geometrically credible, return it
+    unchanged but mark the mode as ``low_confidence_polygon``. The caller can
+    use this status to tell the user to reposition the phone so more court
+    boundary lines are visible.
     """
     if frame is None or not court_corners:
-        return court_corners, "detected_polygon"
+        return court_corners, "court_not_detected"
 
     try:
         if isinstance(court_corners, dict):
-            pts = np.array([
-                court_corners["top_left"],
-                court_corners["top_right"],
-                court_corners["bottom_right"],
-                court_corners["bottom_left"],
-            ], dtype=np.float32)
+            required = (
+                "top_left",
+                "top_right",
+                "bottom_right",
+                "bottom_left",
+            )
+            if not all(key in court_corners for key in required):
+                return court_corners, "invalid_corners"
+
+            pts = np.array(
+                [court_corners[key] for key in required],
+                dtype=np.float32,
+            )
         else:
             pts = np.array(list(court_corners), dtype=np.float32)
 
-        if pts.shape != (4, 2):
-            return court_corners, "detected_polygon"
+        if pts.shape != (4, 2) or not np.isfinite(pts).all():
+            return court_corners, "invalid_corners"
 
         h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        white = ((gray > 155) & (hsv[:, :, 1] < 170)).astype(np.uint8)
 
-        a = pts[0]  # top-left
-        b = pts[3]  # bottom-left: likely visible sideline
-        edge = b - a
-        length = float(np.linalg.norm(edge))
-        if length < 100:
-            return court_corners, "detected_polygon"
+        # Reject points far outside the image. A small tolerance is allowed
+        # because line intersections can fall just beyond the visible frame.
+        if (
+            np.any(pts[:, 0] < -0.10 * w)
+            or np.any(pts[:, 0] > 1.10 * w)
+            or np.any(pts[:, 1] < -0.10 * h)
+            or np.any(pts[:, 1] > 1.10 * h)
+        ):
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        tangent = edge / length
-        normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+        # Ensure the four points form a convex quadrilateral. No orientation
+        # or colour assumption is used here.
+        hull = cv2.convexHull(pts).reshape(-1, 2)
+        if len(hull) != 4:
+            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        # Sample line density on both sides of the sideline, avoiding the
-        # sideline itself.  Use a central portion to reduce wall/floor noise.
-        inside_score = 0.0
-        outside_score = 0.0
-        samples = 0
-        for t in np.linspace(0.12, 0.88, 18):
-            base = a + edge * float(t)
-            for d in (35.0, 65.0, 95.0):
-                for sign, accum in ((1.0, "inside"), (-1.0, "outside")):
-                    p = base + normal * (sign * d)
-                    cx, cy = int(round(float(p[0]))), int(round(float(p[1])))
-                    if 0 <= cx < w and 0 <= cy < h:
-                        x0, x1 = max(0, cx - 12), min(w, cx + 13)
-                        y0, y1 = max(0, cy - 12), min(h, cy + 13)
-                        density = float(np.mean(white[y0:y1, x0:x1]))
-                        if accum == "inside":
-                            inside_score += density
-                        else:
-                            outside_score += density
-                        samples += 1
+        polygon = hull.astype(np.float32)
 
-        if samples == 0:
-            return court_corners, "detected_polygon"
+        area = abs(float(cv2.contourArea(polygon)))
+        frame_area = float(max(1, w * h))
+        area_ratio = area / frame_area
 
-        # 'inside' is the +normal side of the left edge.  If the opposite
-        # side has substantially more court-line structure, the polygon is
-        # likely on the wrong side.
-        if outside_score > inside_score * 1.35 and outside_score > 1.5:
-            # Build the visible court region between the sideline and the
-            # image's left edge, using the detected top/bottom intersections.
-            region = np.array([
-                [0, int(round(a[1]))],
-                [int(round(a[0])), int(round(a[1]))],
-                [int(round(b[0])), int(round(b[1]))],
-                [0, int(round(b[1]))],
-            ], dtype=np.int32)
-            return region.tolist(), "visible_left_side"
+        # A court occupying only a tiny fraction of the image is unlikely to
+        # provide enough geometry for a reliable public-use line call.
+        if area_ratio < 0.04:
+            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
-        return pts.astype(np.int32).tolist(), "detected_polygon"
+        # Check that every side is visible at a useful scale.
+        side_lengths = [
+            float(np.linalg.norm(polygon[(i + 1) % 4] - polygon[i]))
+            for i in range(4)
+        ]
+        if min(side_lengths) < max(35.0, min(w, h) * 0.025):
+            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        # Reject extremely distorted/self-inconsistent quadrilaterals.
+        if max(side_lengths) / max(min(side_lengths), 1.0) > 18.0:
+            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        # Opposite court edges should have broadly consistent directions in
+        # perspective. We compare the two pairs without assuming which side
+        # is "left", "right", "top", or "bottom".
+        def direction_similarity(a, b):
+            na = np.linalg.norm(a)
+            nb = np.linalg.norm(b)
+            if na < 1e-6 or nb < 1e-6:
+                return 0.0
+            return abs(float(np.dot(a, b) / (na * nb)))
+
+        edge_vectors = [
+            polygon[(i + 1) % 4] - polygon[i]
+            for i in range(4)
+        ]
+        parallel_a = direction_similarity(edge_vectors[0], edge_vectors[2])
+        parallel_b = direction_similarity(edge_vectors[1], edge_vectors[3])
+
+        geometry_score = (
+            0.35 * min(1.0, area_ratio / 0.25)
+            + 0.325 * parallel_a
+            + 0.325 * parallel_b
+        )
+
+        if geometry_score < 0.58:
+            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+
+        return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
     except Exception:
-        return court_corners, "detected_polygon"
+        return court_corners, "low_confidence_polygon"
 
 
 def check_landing_inside_court(landing_point, court_corners, margin=0):
@@ -597,12 +623,12 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
 def track_shuttle(frame_candidates_by_frame):
     """
-    Bidirectional trajectory tracking with multi-seed temporal validation.
+    Bidirectional trajectory tracking.
 
-    Instead of choosing only the strongest candidate frame, test strong
-    candidates from across the clip. This prevents a late false detection
-    from becoming the entire trajectory when an earlier, longer trajectory
-    is available.
+    The old tracker only searched forward from one candidate. That could
+    produce one-point tracks when the strongest candidate appeared late in a
+    clip. This tracker searches both directions and selects the strongest
+    continuous path.
     """
     usable = [
         (i, candidates)
@@ -612,54 +638,23 @@ def track_shuttle(frame_candidates_by_frame):
     if not usable:
         return [], 0.0
 
-    def candidate_strength(candidate):
-        return float(
-            candidate.get("score", 0.0)
-            * (0.55 + 1.45 * candidate.get("motion_ratio", 0.0))
+    seed_frame, seed_candidates = max(
+        usable,
+        key=lambda item: max(
+            c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0))
+            for c in item[1]
         )
-
-    # Build seed hypotheses across the whole clip, not just one frame.
-    # A real shuttle should be supported by a continuous sequence of
-    # detections, while an accidental bright object is often isolated.
-    seed_pool = []
-    for frame_no, candidates in usable:
-        ranked = sorted(candidates, key=candidate_strength, reverse=True)[:3]
-        for candidate in ranked:
-            nearby = 0
-            for j in range(max(0, frame_no - 2), min(len(frame_candidates_by_frame), frame_no + 3)):
-                if j != frame_no and frame_candidates_by_frame[j]:
-                    nearby += 1
-            support = 1.0 + 0.20 * (nearby / 4.0)
-            seed_pool.append((candidate_strength(candidate) * support, frame_no, candidate))
-
-    seed_pool.sort(key=lambda item: item[0], reverse=True)
-
-    # Keep seeds distributed through time so one late false detection cannot
-    # dominate all hypotheses. At most 24 seeds are evaluated.
-    selected_seeds = []
-    used_frames = []
-    for strength, frame_no, candidate in seed_pool:
-        if any(abs(frame_no - f) < 4 for f in used_frames):
-            continue
-        selected_seeds.append((frame_no, candidate))
-        used_frames.append(frame_no)
-        if len(selected_seeds) >= 24:
-            break
-
-    # If temporal spacing filtered too aggressively, fill from remaining
-    # strongest candidates.
-    if len(selected_seeds) < 8:
-        for _, frame_no, candidate in seed_pool:
-            if (frame_no, candidate) in selected_seeds:
-                continue
-            selected_seeds.append((frame_no, candidate))
-            if len(selected_seeds) >= 8:
-                break
+    )
+    seed_candidates = sorted(
+        seed_candidates,
+        key=lambda c: c["score"] * (0.55 + 1.45 * c.get("motion_ratio", 0.0)),
+        reverse=True,
+    )[:8]
 
     best_path = []
     best_quality = -1e9
 
-    for seed_frame, seed in selected_seeds:
+    for seed in seed_candidates:
         backward = _track_one_direction(
             frame_candidates_by_frame,
             seed_frame,
@@ -677,38 +672,26 @@ def track_shuttle(frame_candidates_by_frame):
         path.sort(key=lambda p: p["frame"])
 
         if len(path) < 2:
-            continue
-
-        jumps = []
-        for a, b in zip(path[:-1], path[1:]):
-            gap = max(1, b["frame"] - a["frame"])
-            jumps.append(
-                math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-                / (700.0 * gap)
+            quality = seed["score"]
+        else:
+            jumps = []
+            for a, b in zip(path[:-1], path[1:]):
+                gap = max(1, b["frame"] - a["frame"])
+                jumps.append(
+                    math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+                    / (700.0 * gap)
+                )
+            smoothness = 1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0)))
+            length_score = min(1.0, len(path) / 10.0)
+            x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
+            y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
+            movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
+            quality = (
+                0.35 * smoothness
+                + 0.30 * length_score
+                + 0.20 * movement_score
+                + 0.15 * seed["score"]
             )
-
-        smoothness = max(
-            0.0,
-            1.0 - float(np.mean(np.clip(jumps, 0.0, 1.0))),
-        )
-        length_score = min(1.0, len(path) / 10.0)
-        x_span = max(p["x"] for p in path) - min(p["x"] for p in path)
-        y_span = max(p["y"] for p in path) - min(p["y"] for p in path)
-        movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
-
-        # Strongly favor trajectories supported by multiple frames. A short
-        # isolated 3-4 point false track should lose to a longer continuous
-        # shuttle track even if its seed candidate is visually strong.
-        quality = (
-            0.50 * length_score
-            + 0.25 * smoothness
-            + 0.20 * movement_score
-            + 0.05 * seed["score"]
-        )
-        if len(path) < 5:
-            quality -= 0.20
-        if len(path) < 4:
-            quality -= 0.20
 
         if quality > best_quality:
             best_quality = quality
@@ -734,6 +717,7 @@ def track_shuttle(frame_candidates_by_frame):
     y_span = max(p["y"] for p in best_path) - min(p["y"] for p in best_path)
     movement_score = min(1.0, math.hypot(x_span, y_span) / 180.0)
 
+    # Require meaningful spatial movement before reporting a confident track.
     if movement_score < 0.20:
         return best_path, 0.0
 
@@ -801,7 +785,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 1.8 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 1.9 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -1132,7 +1116,14 @@ async def analyze_video(video: UploadFile = File(...)):
         court_analysis = detect_court(first_frame)
         court_corners = get_court_corners(first_frame)
         court_analysis["corners"] = court_corners
-        court_region, court_region_mode = build_court_region(first_frame, court_corners)
+
+        # Court geometry is orientation-independent. The phone can be placed
+        # anywhere around/inside the court; no left/right or colour assumption.
+        court_region, court_region_mode = build_court_region(
+            first_frame,
+            court_corners,
+        )
+
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -1225,6 +1216,22 @@ async def analyze_video(video: UploadFile = File(...)):
                 "corners": court_corners,
                 "playable_region": court_region,
                 "region_mode": court_region_mode,
+                "setup": {
+                    "status": (
+                        "READY"
+                        if court_region_mode == "geometry_polygon"
+                        else "REPOSITION_PHONE"
+                    ),
+                    "instruction": (
+                        "Court geometry detected. Keep the phone steady."
+                        if court_region_mode == "geometry_polygon"
+                        else
+                        "Move the phone until multiple court boundary lines "
+                        "and the court corners are clearly visible."
+                    ),
+                    "colour_independent": True,
+                    "orientation_independent": True,
+                },
             },
             "shuttle_detection": {
                 "shuttle_detected": bool(shuttle_detected),
