@@ -159,7 +159,7 @@ def build_court_region(frame, court_corners):
         # 'inside' is the +normal side of the left edge.  If the opposite
         # side has substantially more court-line structure, the polygon is
         # likely on the wrong side.
-        if outside_score > inside_score * 1.35 and outside_score > 1.5:
+        if inside_score > outside_score * 1.35 and inside_score > 1.5:
             # Build the visible court region between the sideline and the
             # image's left edge, using the detected top/bottom intersections.
             region = np.array([
