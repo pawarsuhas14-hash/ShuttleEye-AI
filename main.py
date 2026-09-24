@@ -12,7 +12,7 @@ import time
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="2.1.3",
+    version="2.1.4",
 )
 
 
@@ -21,7 +21,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "2.1.3",
+        "version": "2.1.4",
     }
 
 
@@ -185,13 +185,20 @@ def build_court_region(frame, court_corners):
             if x <= frame_tol_x or x >= (w - 1 - frame_tol_x) or y <= frame_tol_y or y >= (h - 1 - frame_tol_y):
                 near_frame += 1
 
+        # A phone may show only part of the court. Do not require all four
+        # corners, or even two well-supported polygon edges, when the visible
+        # court-line network is otherwise strong. Keep conservative geometry
+        # and frame-edge checks so walls/furniture are not accepted casually.
+        sorted_support = sorted(edge_support, reverse=True)
+        strongest_support = sorted_support[0] if sorted_support else 0.0
+        second_support = sorted_support[1] if len(sorted_support) > 1 else 0.0
         support_ok = (
-            max(edge_support) >= 0.42
-            and sorted(edge_support, reverse=True)[1] >= 0.08
-            and near_frame <= 2
+            strongest_support >= 0.36
+            and (second_support >= 0.04 or strongest_support >= 0.62)
+            and near_frame <= 3
         )
 
-        if area_ratio <= 0.50 and geometry_score >= 0.58 and support_ok:
+        if area_ratio <= 0.65 and geometry_score >= 0.52 and support_ok:
             return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
         # ------------------------------------------------------------------
@@ -301,7 +308,10 @@ def build_court_region(frame, court_corners):
                     near_crossings[side] += 1
 
             total_support = side_length[0] + side_length[1]
-            if total_support < 0.55 * min_dim:
+            # Partial-court views can expose only a few perpendicular lines.
+            # Accept a smaller but still meaningful court-line network; the
+            # score below still requires imbalance, crossings and line length.
+            if total_support < 0.35 * min_dim:
                 continue
 
             richer = 0 if side_length[0] >= side_length[1] else 1
@@ -325,7 +335,9 @@ def build_court_region(frame, court_corners):
             if best is None or score > best[0]:
                 best = (score, line, normal, richer, side_length, side_count)
 
-        if best is None or best[0] < 0.38:
+        # Lower than the full-court threshold, but not low enough to accept
+        # arbitrary long structures such as walls or furniture.
+        if best is None or best[0] < 0.30:
             return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
 
         score, line, normal, richer, side_length, side_count = best
