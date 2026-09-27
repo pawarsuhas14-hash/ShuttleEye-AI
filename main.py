@@ -1073,6 +1073,7 @@ def choose_landing_point(trajectory, fps, court_corners=None):
         settle_evidence = abs(reversal) <= 15
 
         if not (bounce_evidence or settle_evidence):
+            if d1 < 6:
             continue
 
         # Prefer deeper, more clearly descending points.
