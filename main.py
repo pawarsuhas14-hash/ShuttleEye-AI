@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from court_corners import get_court_corners
 import cv2
@@ -8,6 +8,9 @@ import uuid
 import shutil
 import math
 import time
+import asyncio
+import json
+from collections import deque
 
 app = FastAPI(
     title="ShuttleEye AI",
@@ -29,6 +32,255 @@ def home():
 def health():
     return {"status": "healthy"}
 
+
+def _court_geometry_changed(reference, current, frame_shape):
+    """Compare court quads for translation, rotation, scale, and perspective."""
+    if reference is None or current is None:
+        return True
+    reference = np.asarray(reference, dtype=np.float32)
+    current = np.asarray(current, dtype=np.float32)
+    if reference.shape != (4, 2) or current.shape != (4, 2):
+        return True
+    height, width = frame_shape[:2]
+    diagonal = max(1.0, math.hypot(width, height))
+    ref_center, cur_center = np.mean(reference, axis=0), np.mean(current, axis=0)
+    translation = float(np.linalg.norm(cur_center - ref_center)) / diagonal
+    ref_edges = np.roll(reference, -1, axis=0) - reference
+    cur_edges = np.roll(current, -1, axis=0) - current
+    ref_lengths = np.linalg.norm(ref_edges, axis=1)
+    cur_lengths = np.linalg.norm(cur_edges, axis=1)
+    if np.min(ref_lengths) < 1 or np.min(cur_lengths) < 1:
+        return True
+    scale_ratios = cur_lengths / ref_lengths
+    scale_change = float(np.max(np.abs(scale_ratios - 1.0)))
+    ref_angle = math.atan2(float(ref_edges[0, 1]), float(ref_edges[0, 0]))
+    cur_angle = math.atan2(float(cur_edges[0, 1]), float(cur_edges[0, 0]))
+    angle_delta = abs((cur_angle - ref_angle + math.pi) % (2.0 * math.pi) - math.pi)
+    rotation = cur_angle - ref_angle
+    cosine, sine = math.cos(rotation), math.sin(rotation)
+    rotation_matrix = np.array([[cosine, -sine], [sine, cosine]], dtype=np.float32)
+    ref_centered, cur_centered = reference - ref_center, current - cur_center
+    aligned = ref_centered @ rotation_matrix.T * float(np.mean(scale_ratios))
+    shape_change = float(np.sqrt(np.mean(np.sum((cur_centered - aligned) ** 2, axis=1)))) / diagonal
+    return (
+        translation > 0.02
+        or angle_delta > math.radians(2.0)
+        or scale_change > 0.05
+        or shape_change > 0.02
+    )
+
+
+def _global_translation_detected(previous_gray, current_gray):
+    """Spot camera translation between court-geometry checks using phase correlation."""
+    if previous_gray is None or current_gray is None or previous_gray.shape != current_gray.shape:
+        return False
+    height, width = current_gray.shape[:2]
+    scale = min(1.0, 320.0 / max(width, height))
+    if scale < 1.0:
+        size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        previous = cv2.resize(previous_gray, size)
+        current = cv2.resize(current_gray, size)
+    else:
+        previous, current = previous_gray, current_gray
+    shift, response = cv2.phaseCorrelate(
+        np.float32(previous), np.float32(current)
+    )
+    threshold = max(2.5, math.hypot(current.shape[1], current.shape[0]) * 0.008)
+    return response >= 0.35 and math.hypot(float(shift[0]), float(shift[1])) >= threshold
+
+
+class LiveAnalysisSession:
+    """Per-WebSocket court geometry and bounded shuttle tracking state."""
+
+    def __init__(self, session_id, first_frame_id=0):
+        self.session_id = session_id
+        self.next_frame_id = first_frame_id
+        self.frame_count = 0
+        self.geometry_check_pending = False
+        self.corners = None
+        self.reference_corners = None
+        self.region = None
+        self.region_mode = "court_not_detected"
+        self.static_line_mask = None
+        self.previous_gray = None
+        self.previous_previous_gray = None
+        self.candidate_frames = deque(maxlen=16)
+        self.history_frame_ids = deque(maxlen=16)
+
+    def clear_tracking(self):
+        self.static_line_mask = None
+        self.previous_gray = None
+        self.previous_previous_gray = None
+        self.candidate_frames.clear()
+        self.history_frame_ids.clear()
+
+    def process_frame(self, frame, frame_id):
+        started_at = time.monotonic()
+        height, width = frame.shape[:2]
+        scale = min(1.0, 1280.0 / max(width, height))
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
+
+        recalibrating = False
+        if self.region is None or self.geometry_check_pending or self.frame_count % 4 == 0:
+            corners = get_court_corners(frame)
+            region, region_mode = build_court_region(frame, corners)
+            self.geometry_check_pending = False
+            geometry_ready = region_mode == "geometry_polygon"
+            if not geometry_ready:
+                self.corners = self.reference_corners = self.region = None
+                self.region_mode = region_mode
+                self.clear_tracking()
+                self.frame_count += 1
+                return {
+                    "state": "SEARCHING_FOR_COURT",
+                    "geometry": {"ready": False, "confidence": "insufficient", "mode": region_mode},
+                    "shuttle_tracking": {"active": False, "tracked_points": 0, "confidence": 0.0},
+                    "decision": {"result": "UNKNOWN"},
+                    "message": "Move phone until more court boundary lines are visible.",
+                    "frame_id": frame_id,
+                    "processing_ms": round((time.monotonic() - started_at) * 1000, 1),
+                }
+
+            current_corners = np.array([
+                corners[k] for k in ("top_left", "top_right", "bottom_right", "bottom_left")
+            ], dtype=np.float32) if isinstance(corners, dict) else np.asarray(corners, dtype=np.float32)
+            if self.reference_corners is not None and _court_geometry_changed(
+                self.reference_corners, current_corners, frame.shape
+            ):
+                self.clear_tracking()
+                recalibrating = True
+                self.reference_corners = current_corners.copy()
+            elif self.reference_corners is None:
+                self.reference_corners = current_corners.copy()
+            self.corners, self.region, self.region_mode = corners, region, region_mode
+
+        if self.region is None or self.region_mode != "geometry_polygon":
+            state, message = "SEARCHING_FOR_COURT", "Move phone until more court boundary lines are visible."
+            decision = {"result": "UNKNOWN"}
+            tracking = {"active": False, "tracked_points": 0, "confidence": 0.0}
+        else:
+            court_analysis = detect_court(frame) if self.static_line_mask is None else None
+            if self.static_line_mask is None:
+                self.static_line_mask = build_static_line_mask(frame, court_analysis)
+            current_gray, candidates = extract_frame_candidates(
+                frame, self.previous_gray, self.previous_previous_gray,
+                static_line_mask=self.static_line_mask,
+            )
+            camera_translated = _global_translation_detected(self.previous_gray, current_gray)
+            if camera_translated:
+                self.clear_tracking()
+                self.geometry_check_pending = True
+                recalibrating = True
+                court_analysis = detect_court(frame)
+                self.static_line_mask = build_static_line_mask(frame, court_analysis)
+                self.previous_gray = current_gray
+                self.previous_previous_gray = None
+                candidates = []
+            else:
+                self.previous_previous_gray, self.previous_gray = self.previous_gray, current_gray
+            self.candidate_frames.append(candidates)
+            self.history_frame_ids.append(frame_id)
+            trajectory, tracking_confidence = track_shuttle(list(self.candidate_frames))
+            landing_point = choose_landing_point(
+                trajectory, 8.0, self.region, frame_size=frame.shape[:2]
+            ) if len(trajectory) >= 4 else None
+            landing_decision = check_landing_inside_court(landing_point, self.region)
+            result = landing_decision.get("result", "UNKNOWN")
+            tracking = {
+                "active": len(trajectory) >= 3,
+                "tracked_points": len(trajectory),
+                "confidence": round(float(tracking_confidence), 3),
+            }
+            decision, landing_event_id = {"result": "UNKNOWN"}, None
+            if recalibrating:
+                state, message = "RECALIBRATING", "Recalibrating — keep phone steady."
+            elif result in ("IN", "OUT") and tracking_confidence >= 0.45 and landing_point is not None:
+                state, message = result, ""
+                landing_index = int(landing_point["frame"])
+                if 0 <= landing_index < len(self.history_frame_ids):
+                    landing_event_id = f"{self.session_id}:{self.history_frame_ids[landing_index]}"
+                decision = {**landing_decision, "result": result}
+                if landing_event_id:
+                    decision["event_id"] = landing_event_id
+            elif landing_point is not None:
+                state, message = "LANDING_ANALYSIS", ""
+            elif len(trajectory) >= 3:
+                state, message = "TRACKING_SHUTTLE", ""
+            elif self.frame_count < 3:
+                state, message = "CALIBRATING", "Court detected — hold phone steady."
+            else:
+                state, message = "COURT_READY", ""
+
+        self.frame_count += 1
+        return {
+            "state": state,
+            "geometry": {
+                "ready": self.region is not None,
+                "confidence": "sufficient" if self.region is not None else "insufficient",
+                "mode": self.region_mode,
+            },
+            "shuttle_tracking": tracking,
+            "decision": decision,
+            "message": message,
+            "frame_id": frame_id,
+            "processing_ms": round((time.monotonic() - started_at) * 1000, 1),
+        }
+
+
+@app.websocket("/ws/analyze-live")
+async def analyze_live(websocket: WebSocket):
+    """Process binary JPEG frames with bounded per-socket analysis state."""
+    await websocket.accept()
+    session = LiveAnalysisSession(str(uuid.uuid4()))
+    current_frame_id = None
+    try:
+        await websocket.send_json({"state": "SEARCHING_FOR_COURT", "message": "Send binary JPEG frames to begin."})
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            if message.get("text") is not None:
+                try:
+                    control = json.loads(message["text"])
+                    session_id = control.get("session_id")
+                    first_frame_id = control.get("next_frame_id", 0)
+                    if (control.get("type") == "session" and isinstance(session_id, str)
+                            and 1 <= len(session_id) <= 80 and isinstance(first_frame_id, int)
+                            and not isinstance(first_frame_id, bool) and 0 <= first_frame_id <= 2**53 - 1):
+                        session = LiveAnalysisSession(session_id, first_frame_id)
+                    else:
+                        await websocket.send_json({"state": "UNKNOWN", "message": "Invalid live-session handshake."})
+                except (ValueError, TypeError, AttributeError):
+                    await websocket.send_json({"state": "UNKNOWN", "message": "Invalid live-session handshake."})
+                continue
+            frame_bytes = message.get("bytes")
+            if frame_bytes is None:
+                continue
+            current_frame_id = session.next_frame_id
+            session.next_frame_id += 1
+            if not frame_bytes or len(frame_bytes) > 8 * 1024 * 1024:
+                session.clear_tracking()
+                await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
+                    "message": "Frame was empty or exceeded the 8 MB limit.", "frame_id": current_frame_id})
+                continue
+            frame = await asyncio.to_thread(cv2.imdecode, np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                session.clear_tracking()
+                await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
+                    "message": "Could not decode JPEG frame.", "frame_id": current_frame_id})
+                continue
+            result = await asyncio.to_thread(session.process_frame, frame, current_frame_id)
+            await websocket.send_json(result)
+    except WebSocketDisconnect:
+        return
+    except Exception as error:
+        print(f"live analysis error: {type(error).__name__}: {error}")
+        try:
+            await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
+                "message": "Live analysis failed. Reconnecting is safe.", "frame_id": current_frame_id})
+        except Exception:
+            pass
 
 def detect_court(frame):
     """Detect visible court lines for diagnostics."""
@@ -1028,7 +1280,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     return debug
 
 
-def choose_landing_point(trajectory, fps, court_corners=None):
+def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
     """
     Conservative landing estimator with bounce/reversal detection.
 
@@ -1044,14 +1296,17 @@ def choose_landing_point(trajectory, fps, court_corners=None):
     """
     if len(trajectory) < 4:
         return None
+    if frame_size is None or len(frame_size) < 2:
+        return None
 
     x_span = max(p["x"] for p in trajectory) - min(p["x"] for p in trajectory)
     y_span = max(p["y"] for p in trajectory) - min(p["y"] for p in trajectory)
     if math.hypot(x_span, y_span) < 50.0:
         return None
 
-    h_limit = 1920
-    w_limit = 1080
+    h_limit, w_limit = int(frame_size[0]), int(frame_size[1])
+    if h_limit <= 0 or w_limit <= 0:
+        return None
     last = trajectory[-1]
 
     # Leaving the frame is not a landing.
@@ -1224,7 +1479,7 @@ async def debug_video(video: UploadFile = File(...)):
             frame_candidates_by_frame
         )
         landing_point = (
-            choose_landing_point(trajectory, fps, court_region)
+            choose_landing_point(trajectory, fps, court_region, frame_size=first_frame.shape[:2])
             if len(trajectory) >= 3
             else None
         )
@@ -1399,7 +1654,7 @@ async def analyze_video(video: UploadFile = File(...)):
         shuttle_detected = len(trajectory) >= 3
 
         estimated_landing_point = (
-            choose_landing_point(trajectory, fps, court_region)
+            choose_landing_point(trajectory, fps, court_region, frame_size=first_frame.shape[:2])
             if shuttle_detected
             else None
         )
