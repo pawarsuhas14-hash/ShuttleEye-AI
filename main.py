@@ -1,22 +1,46 @@
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from court_corners import get_court_corners
+from court_geometry import infer_court_region_from_lines
+from runtime_analyzer import LiveFrameAnalyzer
+from baseline_geometry import classify_baseline_landing, match_baseline_observation, normalize_baseline_config
+import asyncio
 import cv2
 import numpy as np
 import os
+import tempfile
 import uuid
-import shutil
 import math
 import time
-import asyncio
 import json
-from collections import deque
+import logging
 
 app = FastAPI(
     title="ShuttleEye AI",
     description="AI-powered badminton shuttle detection and line-call analysis",
-    version="2.1.4",
+    version="2.1.5",
 )
+
+MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+logger = logging.getLogger(__name__)
+
+
+async def save_video_upload(upload, destination):
+    """Stream uploads to disk with a bounded size to protect worker memory."""
+    size = 0
+    with open(destination, "wb") as output:
+        while True:
+            chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise ValueError("Video exceeds the 250 MB upload limit")
+            output.write(chunk)
+    if size == 0:
+        raise ValueError("Uploaded video is empty")
+    return size
 
 
 @app.get("/")
@@ -24,7 +48,7 @@ def home():
     return {
         "message": "Welcome to ShuttleEye AI",
         "status": "running",
-        "version": "2.1.4",
+        "version": "2.1.5",
     }
 
 
@@ -33,254 +57,15 @@ def health():
     return {"status": "healthy"}
 
 
-def _court_geometry_changed(reference, current, frame_shape):
-    """Compare court quads for translation, rotation, scale, and perspective."""
-    if reference is None or current is None:
-        return True
-    reference = np.asarray(reference, dtype=np.float32)
-    current = np.asarray(current, dtype=np.float32)
-    if reference.shape != (4, 2) or current.shape != (4, 2):
-        return True
-    height, width = frame_shape[:2]
-    diagonal = max(1.0, math.hypot(width, height))
-    ref_center, cur_center = np.mean(reference, axis=0), np.mean(current, axis=0)
-    translation = float(np.linalg.norm(cur_center - ref_center)) / diagonal
-    ref_edges = np.roll(reference, -1, axis=0) - reference
-    cur_edges = np.roll(current, -1, axis=0) - current
-    ref_lengths = np.linalg.norm(ref_edges, axis=1)
-    cur_lengths = np.linalg.norm(cur_edges, axis=1)
-    if np.min(ref_lengths) < 1 or np.min(cur_lengths) < 1:
-        return True
-    scale_ratios = cur_lengths / ref_lengths
-    scale_change = float(np.max(np.abs(scale_ratios - 1.0)))
-    ref_angle = math.atan2(float(ref_edges[0, 1]), float(ref_edges[0, 0]))
-    cur_angle = math.atan2(float(cur_edges[0, 1]), float(cur_edges[0, 0]))
-    angle_delta = abs((cur_angle - ref_angle + math.pi) % (2.0 * math.pi) - math.pi)
-    rotation = cur_angle - ref_angle
-    cosine, sine = math.cos(rotation), math.sin(rotation)
-    rotation_matrix = np.array([[cosine, -sine], [sine, cosine]], dtype=np.float32)
-    ref_centered, cur_centered = reference - ref_center, current - cur_center
-    aligned = ref_centered @ rotation_matrix.T * float(np.mean(scale_ratios))
-    shape_change = float(np.sqrt(np.mean(np.sum((cur_centered - aligned) ** 2, axis=1)))) / diagonal
-    return (
-        translation > 0.02
-        or angle_delta > math.radians(2.0)
-        or scale_change > 0.05
-        or shape_change > 0.02
-    )
+def _index_live_frame_update(update, received_frame_index, legacy_frame_id=None):
+    """Correlate each binary WebSocket message, even when JPEG decoding fails."""
+    indexed = dict(update)
+    indexed.setdefault("analysis_frame_index", indexed.get("frame_index"))
+    indexed["frame_index"] = received_frame_index
+    if legacy_frame_id is not None:
+        indexed["frame_id"] = legacy_frame_id
+    return indexed
 
-
-def _global_translation_detected(previous_gray, current_gray):
-    """Spot camera translation between court-geometry checks using phase correlation."""
-    if previous_gray is None or current_gray is None or previous_gray.shape != current_gray.shape:
-        return False
-    height, width = current_gray.shape[:2]
-    scale = min(1.0, 320.0 / max(width, height))
-    if scale < 1.0:
-        size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        previous = cv2.resize(previous_gray, size)
-        current = cv2.resize(current_gray, size)
-    else:
-        previous, current = previous_gray, current_gray
-    shift, response = cv2.phaseCorrelate(
-        np.float32(previous), np.float32(current)
-    )
-    threshold = max(2.5, math.hypot(current.shape[1], current.shape[0]) * 0.008)
-    return response >= 0.35 and math.hypot(float(shift[0]), float(shift[1])) >= threshold
-
-
-class LiveAnalysisSession:
-    """Per-WebSocket court geometry and bounded shuttle tracking state."""
-
-    def __init__(self, session_id, first_frame_id=0):
-        self.session_id = session_id
-        self.next_frame_id = first_frame_id
-        self.frame_count = 0
-        self.geometry_check_pending = False
-        self.corners = None
-        self.reference_corners = None
-        self.region = None
-        self.region_mode = "court_not_detected"
-        self.static_line_mask = None
-        self.previous_gray = None
-        self.previous_previous_gray = None
-        self.candidate_frames = deque(maxlen=16)
-        self.history_frame_ids = deque(maxlen=16)
-
-    def clear_tracking(self):
-        self.static_line_mask = None
-        self.previous_gray = None
-        self.previous_previous_gray = None
-        self.candidate_frames.clear()
-        self.history_frame_ids.clear()
-
-    def process_frame(self, frame, frame_id):
-        started_at = time.monotonic()
-        height, width = frame.shape[:2]
-        scale = min(1.0, 1280.0 / max(width, height))
-        if scale < 1.0:
-            frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
-
-        recalibrating = False
-        if self.region is None or self.geometry_check_pending or self.frame_count % 4 == 0:
-            corners = get_court_corners(frame)
-            region, region_mode = build_court_region(frame, corners)
-            self.geometry_check_pending = False
-            geometry_ready = region_mode == "geometry_polygon"
-            if not geometry_ready:
-                self.corners = self.reference_corners = self.region = None
-                self.region_mode = region_mode
-                self.clear_tracking()
-                self.frame_count += 1
-                return {
-                    "state": "SEARCHING_FOR_COURT",
-                    "geometry": {"ready": False, "confidence": "insufficient", "mode": region_mode},
-                    "shuttle_tracking": {"active": False, "tracked_points": 0, "confidence": 0.0},
-                    "decision": {"result": "UNKNOWN"},
-                    "message": "Move phone until more court boundary lines are visible.",
-                    "frame_id": frame_id,
-                    "processing_ms": round((time.monotonic() - started_at) * 1000, 1),
-                }
-
-            current_corners = np.array([
-                corners[k] for k in ("top_left", "top_right", "bottom_right", "bottom_left")
-            ], dtype=np.float32) if isinstance(corners, dict) else np.asarray(corners, dtype=np.float32)
-            if self.reference_corners is not None and _court_geometry_changed(
-                self.reference_corners, current_corners, frame.shape
-            ):
-                self.clear_tracking()
-                recalibrating = True
-                self.reference_corners = current_corners.copy()
-            elif self.reference_corners is None:
-                self.reference_corners = current_corners.copy()
-            self.corners, self.region, self.region_mode = corners, region, region_mode
-
-        if self.region is None or self.region_mode != "geometry_polygon":
-            state, message = "SEARCHING_FOR_COURT", "Move phone until more court boundary lines are visible."
-            decision = {"result": "UNKNOWN"}
-            tracking = {"active": False, "tracked_points": 0, "confidence": 0.0}
-        else:
-            court_analysis = detect_court(frame) if self.static_line_mask is None else None
-            if self.static_line_mask is None:
-                self.static_line_mask = build_static_line_mask(frame, court_analysis)
-            current_gray, candidates = extract_frame_candidates(
-                frame, self.previous_gray, self.previous_previous_gray,
-                static_line_mask=self.static_line_mask,
-            )
-            camera_translated = _global_translation_detected(self.previous_gray, current_gray)
-            if camera_translated:
-                self.clear_tracking()
-                self.geometry_check_pending = True
-                recalibrating = True
-                court_analysis = detect_court(frame)
-                self.static_line_mask = build_static_line_mask(frame, court_analysis)
-                self.previous_gray = current_gray
-                self.previous_previous_gray = None
-                candidates = []
-            else:
-                self.previous_previous_gray, self.previous_gray = self.previous_gray, current_gray
-            self.candidate_frames.append(candidates)
-            self.history_frame_ids.append(frame_id)
-            trajectory, tracking_confidence = track_shuttle(list(self.candidate_frames))
-            landing_point = choose_landing_point(
-                trajectory, 8.0, self.region, frame_size=frame.shape[:2]
-            ) if len(trajectory) >= 4 else None
-            landing_decision = check_landing_inside_court(landing_point, self.region)
-            result = landing_decision.get("result", "UNKNOWN")
-            tracking = {
-                "active": len(trajectory) >= 3,
-                "tracked_points": len(trajectory),
-                "confidence": round(float(tracking_confidence), 3),
-            }
-            decision, landing_event_id = {"result": "UNKNOWN"}, None
-            if recalibrating:
-                state, message = "RECALIBRATING", "Recalibrating — keep phone steady."
-            elif result in ("IN", "OUT") and tracking_confidence >= 0.45 and landing_point is not None:
-                state, message = result, ""
-                landing_index = int(landing_point["frame"])
-                if 0 <= landing_index < len(self.history_frame_ids):
-                    landing_event_id = f"{self.session_id}:{self.history_frame_ids[landing_index]}"
-                decision = {**landing_decision, "result": result}
-                if landing_event_id:
-                    decision["event_id"] = landing_event_id
-            elif landing_point is not None:
-                state, message = "LANDING_ANALYSIS", ""
-            elif len(trajectory) >= 3:
-                state, message = "TRACKING_SHUTTLE", ""
-            elif self.frame_count < 3:
-                state, message = "CALIBRATING", "Court detected — hold phone steady."
-            else:
-                state, message = "COURT_READY", ""
-
-        self.frame_count += 1
-        return {
-            "state": state,
-            "geometry": {
-                "ready": self.region is not None,
-                "confidence": "sufficient" if self.region is not None else "insufficient",
-                "mode": self.region_mode,
-            },
-            "shuttle_tracking": tracking,
-            "decision": decision,
-            "message": message,
-            "frame_id": frame_id,
-            "processing_ms": round((time.monotonic() - started_at) * 1000, 1),
-        }
-
-
-@app.websocket("/ws/analyze-live")
-async def analyze_live(websocket: WebSocket):
-    """Process binary JPEG frames with bounded per-socket analysis state."""
-    await websocket.accept()
-    session = LiveAnalysisSession(str(uuid.uuid4()))
-    current_frame_id = None
-    try:
-        await websocket.send_json({"state": "SEARCHING_FOR_COURT", "message": "Send binary JPEG frames to begin."})
-        while True:
-            message = await websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                return
-            if message.get("text") is not None:
-                try:
-                    control = json.loads(message["text"])
-                    session_id = control.get("session_id")
-                    first_frame_id = control.get("next_frame_id", 0)
-                    if (control.get("type") == "session" and isinstance(session_id, str)
-                            and 1 <= len(session_id) <= 80 and isinstance(first_frame_id, int)
-                            and not isinstance(first_frame_id, bool) and 0 <= first_frame_id <= 2**53 - 1):
-                        session = LiveAnalysisSession(session_id, first_frame_id)
-                    else:
-                        await websocket.send_json({"state": "UNKNOWN", "message": "Invalid live-session handshake."})
-                except (ValueError, TypeError, AttributeError):
-                    await websocket.send_json({"state": "UNKNOWN", "message": "Invalid live-session handshake."})
-                continue
-            frame_bytes = message.get("bytes")
-            if frame_bytes is None:
-                continue
-            current_frame_id = session.next_frame_id
-            session.next_frame_id += 1
-            if not frame_bytes or len(frame_bytes) > 8 * 1024 * 1024:
-                session.clear_tracking()
-                await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
-                    "message": "Frame was empty or exceeded the 8 MB limit.", "frame_id": current_frame_id})
-                continue
-            frame = await asyncio.to_thread(cv2.imdecode, np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is None:
-                session.clear_tracking()
-                await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
-                    "message": "Could not decode JPEG frame.", "frame_id": current_frame_id})
-                continue
-            result = await asyncio.to_thread(session.process_frame, frame, current_frame_id)
-            await websocket.send_json(result)
-    except WebSocketDisconnect:
-        return
-    except Exception as error:
-        print(f"live analysis error: {type(error).__name__}: {error}")
-        try:
-            await websocket.send_json({"state": "UNKNOWN", "decision": {"result": "UNKNOWN"},
-                "message": "Live analysis failed. Reconnecting is safe.", "frame_id": current_frame_id})
-        except Exception:
-            pass
 
 def detect_court(frame):
     """Detect visible court lines for diagnostics."""
@@ -336,40 +121,68 @@ def detect_court(frame):
         reverse=True,
     )
 
+    # Report line intersections as geometry evidence; the detector does not
+    # promote them to court corners unless a complete supported quadrilateral
+    # is independently validated below.
+    intersections = []
+    for i, first in enumerate(detected_lines[:24]):
+        for second in detected_lines[i + 1:24]:
+            point = _line_intersection(first, second)
+            if point is not None and -0.02 * width <= point[0] <= 1.02 * width and -0.02 * height <= point[1] <= 1.02 * height:
+                if all(math.hypot(point[0] - q["x"], point[1] - q["y"]) > 12 for q in intersections):
+                    intersections.append({"x": round(point[0], 1), "y": round(point[1], 1)})
     return {
-        "court_detected": len(detected_lines) >= 4,
+        "court_detected": False,  # geometry is established by build_court_region
         "court_lines_detected": len(detected_lines),
         "lines": detected_lines[:40],
+        "intersections": intersections[:40],
     }
 
 
-def build_court_region(frame, court_corners):
-    """Build a playable court region without assuming camera orientation or court colour.
+def _line_intersection(a, b):
+    x1, y1, x2, y2 = (a["x1"], a["y1"], a["x2"], a["y2"])
+    x3, y3, x4, y4 = (b["x1"], b["y1"], b["x2"], b["y2"])
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-6:
+        return None
+    det1, det2 = x1 * y2 - y1 * x2, x3 * y4 - y3 * x4
+    return ((det1 * (x3 - x4) - (x1 - x2) * det2) / denom,
+            (det1 * (y3 - y4) - (y1 - y2) * det2) / denom)
 
-    Prefer a validated quadrilateral. If the corner detector produces a
-    frame-spanning polygon, use the visible court-line network to find a
-    substantial interior boundary and infer the playable side from the amount
-    of perpendicular court-line support on each side.
+
+def build_court_region(frame, court_corners, court_lines=None):
+    """Return a playable polygon only when a four-sided region is supported.
+
+    A partial view may contain useful line structure, but without enough
+    evidence to locate all court boundaries, the playable side/extent is
+    ambiguous. That case intentionally returns no region for safe UNKNOWN.
     """
-    if frame is None or not court_corners:
-        return court_corners, "court_not_detected"
+    if frame is None:
+        return None, "court_not_detected"
+
+    def partial_region():
+        region, diagnostics = infer_court_region_from_lines(frame, court_lines or [])
+        return (region, "partial_geometry_polygon") if diagnostics["reliable"] else (None, "insufficient_geometry")
+
+    if not court_corners:
+        return partial_region()
 
     try:
         if isinstance(court_corners, dict):
             keys = ("top_left", "top_right", "bottom_right", "bottom_left")
             if not all(k in court_corners for k in keys):
-                return court_corners, "invalid_corners"
+                return partial_region()
             pts = np.array([court_corners[k] for k in keys], dtype=np.float32)
         else:
             pts = np.array(list(court_corners), dtype=np.float32)
 
         if pts.shape != (4, 2) or not np.isfinite(pts).all():
-            return court_corners, "invalid_corners"
+            return partial_region()
 
         h, w = frame.shape[:2]
         hull = cv2.convexHull(pts).reshape(-1, 2)
         if len(hull) != 4 or not cv2.isContourConvex(hull.reshape(-1, 1, 2)):
-            return pts.astype(np.int32).tolist(), "low_confidence_polygon"
+            return partial_region()
 
         polygon = hull.astype(np.float32)
         area_ratio = abs(float(cv2.contourArea(polygon))) / float(max(1, w * h))
@@ -379,9 +192,9 @@ def build_court_region(frame, court_corners):
         ]
 
         if min(side_lengths) < max(35.0, min(w, h) * 0.025):
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+            return partial_region()
         if max(side_lengths) / max(min(side_lengths), 1.0) > 18.0:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
+            return partial_region()
 
         def direction_similarity(a, b):
             na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -401,13 +214,10 @@ def build_court_region(frame, court_corners):
         # A geometrically neat quad is not enough: Hough can lock onto walls,
         # phone framing, or other long structures.  Require visible court-line
         # evidence before trusting the four-corner result.
-        hsv_geom = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        value_geom = hsv_geom[:, :, 2]
-        sat_geom = hsv_geom[:, :, 1]
-        geom_mask = ((value_geom >= 150) & (sat_geom <= 130)).astype(np.uint8)
-        geom_mask = cv2.morphologyEx(
-            geom_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
-        )
+        # Verify boundary support with image gradients rather than brightness:
+        # a light-coloured floor is not itself evidence of a court marking.
+        gray_geom = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        geom_mask = cv2.Canny(cv2.GaussianBlur(gray_geom, (5, 5), 0), 35, 130)
 
         edge_support = []
         for i in range(4):
@@ -426,7 +236,7 @@ def build_court_region(frame, court_corners):
                     r = 3
                     patch = geom_mask[max(0, py-r):min(h, py+r+1),
                                        max(0, px-r):min(w, px+r+1)]
-                    if patch.size and float(np.mean(patch)) >= 0.25:
+                    if patch.size and float(np.mean(patch > 0)) >= 0.12:
                         hits += 1
             edge_support.append(hits / float(samples))
 
@@ -437,214 +247,36 @@ def build_court_region(frame, court_corners):
             if x <= frame_tol_x or x >= (w - 1 - frame_tol_x) or y <= frame_tol_y or y >= (h - 1 - frame_tol_y):
                 near_frame += 1
 
-        # A phone may show only part of the court. Do not require all four
-        # corners, or even two well-supported polygon edges, when the visible
-        # court-line network is otherwise strong. Keep conservative geometry
-        # and frame-edge checks so walls/furniture are not accepted casually.
-        sorted_support = sorted(edge_support, reverse=True)
-        strongest_support = sorted_support[0] if sorted_support else 0.0
-        second_support = sorted_support[1] if len(sorted_support) > 1 else 0.0
-        support_ok = (
-            strongest_support >= 0.36
-            and (second_support >= 0.04 or strongest_support >= 0.62)
-            and near_frame <= 3
-        )
+        # Every side must have image-gradient support. Vertices may touch the
+        # frame, but a clipped polygon cannot establish an unseen boundary.
+        support_ok = min(edge_support) >= 0.14 and near_frame <= 4
 
-        if area_ratio <= 0.65 and geometry_score >= 0.52 and support_ok:
+        if area_ratio <= 0.65 and geometry_score >= 0.55 and support_ok:
+            if court_lines:
+                line_region, line_diagnostics = infer_court_region_from_lines(frame, court_lines)
+                if not line_diagnostics.get("reliable"):
+                    return partial_region()
+                line_polygon = np.asarray(line_region, dtype=np.float32)
+                variants = [np.roll(line_polygon, shift, axis=0) for shift in range(4)]
+                variants += [np.roll(line_polygon[::-1], shift, axis=0) for shift in range(4)]
+                agreement = min(float(np.mean(np.linalg.norm(polygon - variant, axis=1))) for variant in variants)
+                if agreement > math.hypot(w, h) * 0.08:
+                    # The corner detector and court-line network disagree;
+                    # use only the uniquely supported line solution.
+                    return line_region, "partial_geometry_polygon"
             return polygon.astype(np.int32).tolist(), "geometry_polygon"
 
-        # ------------------------------------------------------------------
-        # Fallback: identify an interior court boundary from bright court
-        # lines. Badminton boundary lines are normally bright/low-saturation;
-        # this does NOT assume a green/blue/red court surface and does not
-        # assume the boundary is vertical/horizontal.
-        # ------------------------------------------------------------------
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        value = hsv[:, :, 2]
-        saturation = hsv[:, :, 1]
-        line_mask = ((value >= 150) & (saturation <= 130)).astype(np.uint8)
-        line_mask = cv2.morphologyEx(
-            line_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
-        )
-
-        raw = cv2.HoughLinesP(
-            line_mask * 255,
-            1,
-            np.pi / 180.0,
-            25,
-            minLineLength=max(55, int(min(w, h) * 0.15)),
-            maxLineGap=28,
-        )
-        if raw is None:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        lines = []
-        for r in raw:
-            vals = np.asarray(r).reshape(-1)
-            if len(vals) < 4:
-                continue
-            x1, y1, x2, y2 = [float(v) for v in vals[:4]]
-            length = math.hypot(x2 - x1, y2 - y1)
-            if length < max(55.0, min(w, h) * 0.15):
-                continue
-            angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
-            lines.append((x1, y1, x2, y2, length, angle))
-
-        if not lines:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        best = None
-        min_dim = float(min(w, h))
-        frame_diag = math.hypot(w, h)
-
-        for idx, line in enumerate(lines):
-            x1, y1, x2, y2, length, angle = line
-            # The boundary itself should be a substantial image structure;
-            # shorter court lines are used only as supporting evidence.
-            if length < 0.40 * max(w, h):
-                continue
-
-            p1 = np.array([x1, y1], dtype=np.float32)
-            p2 = np.array([x2, y2], dtype=np.float32)
-            tangent = (p2 - p1) / max(length, 1e-6)
-            normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
-            midpoint = (p1 + p2) * 0.5
-
-            # Ignore structures whose midpoint is very close to a frame edge.
-            edge_clearance = min(
-                float(midpoint[0]), float(midpoint[1]),
-                float(w - midpoint[0]), float(h - midpoint[1])
-            )
-            if edge_clearance < 0.035 * min_dim:
-                continue
-
-            side_length = [0.0, 0.0]
-            side_count = [0, 0]
-            near_crossings = [0, 0]
-
-            for j, other in enumerate(lines):
-                if j == idx:
-                    continue
-                ox1, oy1, ox2, oy2, olen, oangle = other
-                ov = np.array([ox2 - ox1, oy2 - oy1], dtype=np.float32)
-                on = np.linalg.norm(ov)
-                if on < 1e-6:
-                    continue
-
-                # Perpendicular (within perspective tolerance) lines are the
-                # strongest evidence of a court-line network.
-                if abs(float(np.dot(ov / on, tangent))) > 0.42:
-                    continue
-
-                omp = np.array([(ox1 + ox2) * 0.5, (oy1 + oy2) * 0.5], dtype=np.float32)
-                signed = float(np.dot(omp - midpoint, normal))
-                side = 0 if signed >= 0 else 1
-
-                # Only count clearly separated line support. The boundary line
-                # itself should not make both sides look equally rich.
-                separation = abs(signed)
-                if separation < max(8.0, 0.018 * min_dim):
-                    continue
-
-                weight = min(olen, 0.85 * min_dim)
-                side_length[side] += weight
-                side_count[side] += 1
-
-                # A line whose segment comes close to the candidate boundary
-                # is especially useful evidence of a real court intersection.
-                rel1 = np.array([ox1, oy1], dtype=np.float32) - p1
-                rel2 = np.array([ox2, oy2], dtype=np.float32) - p1
-                along1 = float(np.dot(rel1, tangent))
-                along2 = float(np.dot(rel2, tangent))
-                if max(along1, along2) >= -35.0 and min(along1, along2) <= length + 35.0:
-                    near_crossings[side] += 1
-
-            total_support = side_length[0] + side_length[1]
-            # Partial-court views can expose only a few perpendicular lines.
-            # Accept a smaller but still meaningful court-line network; the
-            # score below still requires imbalance, crossings and line length.
-            if total_support < 0.35 * min_dim:
-                continue
-
-            richer = 0 if side_length[0] >= side_length[1] else 1
-            poorer = 1 - richer
-            imbalance = (
-                side_length[richer] - side_length[poorer]
-            ) / max(total_support, 1.0)
-            count_support = min(1.0, side_count[richer] / 4.0)
-            crossing_support = min(1.0, near_crossings[richer] / 3.0)
-            length_support = min(1.0, length / max(0.60 * min_dim, 1.0))
-            centrality = min(1.0, edge_clearance / max(0.25 * min_dim, 1.0))
-
-            score = (
-                0.40 * imbalance
-                + 0.25 * count_support
-                + 0.20 * crossing_support
-                + 0.10 * length_support
-                + 0.05 * centrality
-            )
-
-            if best is None or score > best[0]:
-                best = (score, line, normal, richer, side_length, side_count)
-
-        # Lower than the full-court threshold, but not low enough to accept
-        # arbitrary long structures such as walls or furniture.
-        if best is None or best[0] < 0.30:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        score, line, normal, richer, side_length, side_count = best
-        x1, y1, x2, y2, length, angle = line
-        p1 = np.array([x1, y1], dtype=np.float32)
-        p2 = np.array([x2, y2], dtype=np.float32)
-        tangent = (p2 - p1) / max(length, 1e-6)
-        chosen_normal = normal if richer == 0 else -normal
-
-        # Extend the boundary line to the image edges, then take the inferred
-        # playable half-plane. This handles arbitrary camera rotation.
-        intersections = []
-        for x_edge in (0.0, float(w - 1)):
-            if abs(tangent[0]) > 1e-6:
-                t = (x_edge - p1[0]) / tangent[0]
-                y = p1[1] + t * tangent[1]
-                if -frame_diag <= y <= h - 1 + frame_diag:
-                    intersections.append(np.array([x_edge, y], dtype=np.float32))
-        for y_edge in (0.0, float(h - 1)):
-            if abs(tangent[1]) > 1e-6:
-                t = (y_edge - p1[1]) / tangent[1]
-                x = p1[0] + t * tangent[0]
-                if -frame_diag <= x <= w - 1 + frame_diag:
-                    intersections.append(np.array([x, y_edge], dtype=np.float32))
-
-        if len(intersections) < 2:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        # Keep the two intersections that are farthest apart.
-        pair = max(
-            ((a, b) for i, a in enumerate(intersections) for b in intersections[i + 1:]),
-            key=lambda ab: float(np.linalg.norm(ab[1] - ab[0]))
-        )
-        a, b = pair
-        extension = frame_diag * 1.5
-        a = a - tangent * extension
-        b = b + tangent * extension
-        c = b + chosen_normal * extension
-        d = a + chosen_normal * extension
-        region = np.array([a, b, c, d], dtype=np.float32)
-
-        # Clip to frame with a convex hull; this creates a stable half-plane
-        # polygon for point-in-polygon testing.
-        region[:, 0] = np.clip(region[:, 0], 0, w - 1)
-        region[:, 1] = np.clip(region[:, 1], 0, h - 1)
-        region = cv2.convexHull(region.astype(np.float32)).reshape(-1, 2)
-        if len(region) < 4:
-            return polygon.astype(np.int32).tolist(), "low_confidence_polygon"
-
-        return region.astype(np.int32).tolist(), "geometry_polygon"
+        # A single line and some perpendicular segments do not establish
+        # which side is the playable court or where its far boundary lies.
+        # Returning a frame-spanning half-plane here caused confident, but
+        # unsupported, calls on partial views. Until a complete court polygon
+        # is supported by four visible boundaries, fail closed.
+        return partial_region()
 
     except Exception:
-        return court_corners, "low_confidence_polygon"
+        return partial_region()
 
-def check_landing_inside_court(landing_point, court_corners, margin=0):
+def check_landing_inside_court(landing_point, court_corners, margin=14):
     if landing_point is None:
         return {
             "result": "UNKNOWN",
@@ -677,7 +309,23 @@ def check_landing_inside_court(landing_point, court_corners, margin=0):
 
         signed_distance = cv2.pointPolygonTest(polygon, point, True)
 
-        if signed_distance >= -float(margin):
+        distance = abs(float(signed_distance))
+        if distance <= 1e-6:
+            return {
+                "result": "IN",
+                "inside": True,
+                "boundary_distance_pixels": 0.0,
+                "message": "Shuttle touched the boundary line; boundary contact is in",
+            }
+        if distance <= float(margin):
+            return {
+                "result": "UNKNOWN",
+                "inside": None,
+                "boundary_distance_pixels": round(distance, 2),
+                "reason": "Landing is too close to a boundary for a safe call",
+            }
+
+        if signed_distance > 0:
             return {
                 "result": "IN",
                 "inside": True,
@@ -688,7 +336,7 @@ def check_landing_inside_court(landing_point, court_corners, margin=0):
         return {
             "result": "OUT",
             "inside": False,
-            "boundary_distance_pixels": round(float(signed_distance), 2),
+            "boundary_distance_pixels": round(distance, 2),
             "message": "Shuttle landed outside court",
         }
     except Exception as e:
@@ -874,11 +522,19 @@ def extract_frame_candidates(frame, previous_gray, previous_previous_gray=None, 
             elif not motion_only and appearance_ratio < 0.05:
                 continue
 
+            # Court lines and other long bright fixtures are a major
+            # false-positive source. A shuttle can be slightly elongated,
+            # but a long white contour is much more likely to be a line,
+            # screen edge, text stroke, or fixture than the shuttle.
+            aspect = max(w, h) / max(1, min(w, h))
+            if aspect > 4.5 and yellow_ratio < 0.20:
+                continue
+
             # Static court lines are a major false-positive source. Suppress
             # candidates sitting on a detected court line unless they have
             # strong yellow/compact-shuttle evidence.
-            if line_ratio > 0.35:
-                if not (yellow_ratio > 0.25 and circularity > 0.08 and area < 180.0):
+            if line_ratio > 0.22:
+                if not (yellow_ratio > 0.25 and circularity > 0.10 and area < 180.0):
                     continue
 
             candidates.append({
@@ -1064,6 +720,7 @@ def _track_one_direction(frame_candidates, start_frame, start_candidate, step):
 
 
 def track_shuttle(frame_candidates_by_frame):
+    total_frames = len(frame_candidates_by_frame)
     """
     Bidirectional trajectory tracking with multi-seed temporal validation.
 
@@ -1205,6 +862,14 @@ def track_shuttle(frame_candidates_by_frame):
     if movement_score < 0.20:
         return best_path, 0.0
 
+    # A path that exists on almost every frame is suspicious for a fixed
+    # court line, screen edge, camera artifact, or another persistent object.
+    # A real shuttle should normally occupy only part of the clip. Be
+    # conservative here so a persistent false track cannot produce IN/OUT.
+    coverage = len(best_path) / max(1, total_frames)
+    if coverage > 0.90:
+        return best_path, 0.0
+
     confidence = (
         0.40 * smoothness
         + 0.35 * length_score
@@ -1269,7 +934,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     if isinstance(decision, dict):
         result = decision.get("result")
 
-    label = f"ShuttleEye 2.1.2 | {result or 'TRACKING'}"
+    label = f"ShuttleEye 2.1.5 | {result or 'TRACKING'}"
     cv2.rectangle(debug, (20, 20), (650, 90), (20, 20, 20), -1)
     cv2.putText(
         debug, label, (40, 68),
@@ -1280,7 +945,7 @@ def create_debug_frame(frame, trajectory, court_corners=None, landing_point=None
     return debug
 
 
-def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
+def choose_landing_point(trajectory, fps, court_corners=None, max_frame_gap=None, frame_size=None):
     """
     Conservative landing estimator with bounce/reversal detection.
 
@@ -1296,25 +961,24 @@ def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
     """
     if len(trajectory) < 4:
         return None
-    if frame_size is None or len(frame_size) < 2:
-        return None
+
+    if frame_size is not None:
+        if len(frame_size) < 2:
+            return None
+        h_limit, w_limit = int(frame_size[0]), int(frame_size[1])
+        if h_limit <= 0 or w_limit <= 0:
+            return None
+        last = trajectory[-1]
+        if (last["y"] < 40 or last["y"] > h_limit - 20
+                or last["x"] < 5 or last["x"] > w_limit - 5):
+            return None
 
     x_span = max(p["x"] for p in trajectory) - min(p["x"] for p in trajectory)
     y_span = max(p["y"] for p in trajectory) - min(p["y"] for p in trajectory)
     if math.hypot(x_span, y_span) < 50.0:
         return None
 
-    h_limit, w_limit = int(frame_size[0]), int(frame_size[1])
-    if h_limit <= 0 or w_limit <= 0:
-        return None
     last = trajectory[-1]
-
-    # Leaving the frame is not a landing.
-    if (
-        last["y"] < 40 or last["y"] > h_limit - 20
-        or last["x"] < 5 or last["x"] > w_limit - 5
-    ):
-        return None
 
     best_idx = None
     best_score = -1e9
@@ -1325,6 +989,14 @@ def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
         p2 = trajectory[i]
         p3 = trajectory[i + 1]
 
+        frame_gaps = (int(p1["frame"]) - int(p0["frame"]),
+                      int(p2["frame"]) - int(p1["frame"]),
+                      int(p3["frame"]) - int(p2["frame"]))
+        # A large tracker gap around contact cannot establish a genuine
+        # descent/reversal; the apparent bounce may be an unrelated object.
+        if any(gap < 1 or (max_frame_gap is not None and gap > max_frame_gap) for gap in frame_gaps):
+            continue
+
         d1 = p1["y"] - p0["y"]
         d2 = p2["y"] - p1["y"]
         reversal = p2["y"] - p3["y"]
@@ -1334,10 +1006,15 @@ def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
             continue
 
         # A landing/bounce candidate is a local maximum in image-Y followed
-        # by a meaningful upward reversal. A small non-reversal is also
-        # accepted for clips where the shuttle simply settles near the floor.
+        # by a meaningful reversal or an observed near-stationary settle.
         bounce_evidence = reversal >= 60
-        settle_evidence = abs(reversal) <= 15
+        settle_evidence = (
+            abs(reversal) <= 15
+            and i + 2 < len(trajectory)
+            and int(trajectory[i + 2]["frame"]) - int(p3["frame"]) <= 2
+            and abs(trajectory[i + 2]["y"] - p2["y"]) <= 15
+            and math.hypot(trajectory[i + 2]["x"] - p2["x"], trajectory[i + 2]["y"] - p2["y"]) <= 20
+        )
 
         if not (bounce_evidence or settle_evidence):
             continue
@@ -1363,12 +1040,9 @@ def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
     xs = np.array([q["x"] for q in local], dtype=np.float32)
     ys = np.array([q["y"] for q in local], dtype=np.float32)
 
-    method = (
-        "downward_phase_bounce"
-        if best_idx + 1 < len(trajectory)
-        and p["y"] - trajectory[best_idx + 1]["y"] >= 60
-        else "downward_phase_settle"
-    )
+    method = ("downward_phase_bounce"
+              if p["y"] - trajectory[best_idx + 1]["y"] >= 60
+              else "downward_phase_settle")
 
     landing = {
         "frame": int(p["frame"]),
@@ -1408,6 +1082,151 @@ def choose_landing_point(trajectory, fps, court_corners=None, frame_size=None):
     return landing
 
 
+def analyze_live_court_frame(frame):
+    """Redetect court geometry on every live frame; never reuse stale pose."""
+    analysis = detect_court(frame)
+    corners = get_court_corners(frame)
+    region, mode = build_court_region(frame, corners, analysis.get("lines", []))
+    reliable = mode in ("geometry_polygon", "partial_geometry_polygon") and region is not None
+    confidence = 0.0
+    diagnostics = {"reliable": False, "reason": mode}
+    if reliable:
+        confidence = 0.78 if mode == "geometry_polygon" else 0.72
+        diagnostics = {"reliable": True, "reason": mode}
+        if mode == "partial_geometry_polygon":
+            _, diagnostics = infer_court_region_from_lines(frame, analysis.get("lines", []))
+    return {
+        "region": region,
+        "mode": mode,
+        "confidence": confidence,
+        "reliable": reliable,
+        "diagnostics": diagnostics,
+        "lines": analysis.get("lines", []),
+    }
+
+
+def analyze_live_baseline_frame(frame, config):
+    """Validate only the explicitly user-marked baseline; do not infer a court polygon."""
+    started = time.perf_counter()
+    analysis = detect_court(frame)
+    height, width = frame.shape[:2]
+    match = match_baseline_observation(analysis.get("lines", []), config, width, height)
+    return {**match, "lines": analysis.get("lines", []),
+            "processing_ms": (time.perf_counter() - started) * 1000.0}
+
+
+def create_live_analyzer():
+    """Build a per-connection state machine with the shared vision primitives."""
+    return LiveFrameAnalyzer(
+        court_analyzer=analyze_live_court_frame,
+        candidate_extractor=extract_frame_candidates,
+        tracker=track_shuttle,
+        landing_estimator=lambda trajectory, fps, region: choose_landing_point(
+            trajectory, fps, region, max_frame_gap=2
+        ),
+        decision_maker=lambda landing, region: check_landing_inside_court(landing, region),
+        static_mask_builder=lambda frame, lines: build_static_line_mask(frame, {"lines": lines}),
+        baseline_validator=analyze_live_baseline_frame,
+        baseline_decision_maker=classify_baseline_landing,
+    )
+
+
+@app.websocket("/ws/analyze-live")
+async def analyze_live(websocket: WebSocket):
+    """Live endpoint with explicit baseline setup and legacy binary-only support.
+
+    New clients send one JSON baseline_calibration message followed by binary
+    JPEG frames. Legacy clients that begin with binary frames keep the existing
+    full-court analysis path. Each processed frame receives a JSON update.
+    """
+    await websocket.accept()
+    analyzer = create_live_analyzer()
+    baseline_mode_requested = False
+    received_frame_index = 0
+    legacy_next_frame_id = None
+    await websocket.send_json({
+        "state": "SEARCHING_FOR_COURT",
+        "message": "Send binary JPEG frames to begin.",
+        "decision": {"result": "UNKNOWN", "reason": "waiting_for_camera_frames"},
+    })
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            encoded = message.get("bytes")
+            if encoded is None and message.get("text") is not None:
+                try:
+                    control = json.loads(message["text"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    control = None
+                if isinstance(control, dict) and control.get("type") == "session":
+                    session_id = control.get("session_id")
+                    first_frame_id = control.get("next_frame_id", 0)
+                    valid_session = (
+                        isinstance(session_id, str) and 1 <= len(session_id) <= 80
+                        and isinstance(first_frame_id, int) and not isinstance(first_frame_id, bool)
+                        and 0 <= first_frame_id <= 2**53 - 1
+                    )
+                    if valid_session:
+                        analyzer._session_id = session_id
+                        legacy_next_frame_id = first_frame_id
+                    else:
+                        await websocket.send_json({"state": "UNKNOWN", "message": "Invalid live-session handshake."})
+                    continue
+
+                baseline_mode_requested = True
+                config = normalize_baseline_config(control)
+                if config is None or not analyzer.configure_baseline(config):
+                    await websocket.send_json({"state": "BASELINE_SEARCH", "baseline_valid": False,
+                                               "decision": {"result": "UNKNOWN", "reason": "baseline_confirmation_invalid"},
+                                               "message": "Mark the intended baseline endpoints and the court side again."})
+                    continue
+                await websocket.send_json(analyzer._baseline_snapshot(reason="baseline_confirmation_started"))
+                continue
+            if encoded is not None:
+                received_frame_index += 1
+            legacy_frame_id = legacy_next_frame_id
+            if legacy_next_frame_id is not None:
+                legacy_next_frame_id += 1
+            if encoded is not None and baseline_mode_requested and analyzer._baseline_config is None:
+                await websocket.send_json(_index_live_frame_update({
+                    "mode": "baseline_live", "state": "BASELINE_SEARCH", "baseline_valid": False,
+                    "baseline_locked": False,
+                    "decision": {"result": "UNKNOWN", "reason": "baseline_confirmation_required"},
+                    "message": "Confirm the intended baseline before live line judging.",
+                }, received_frame_index, legacy_frame_id))
+                continue
+            if encoded is None:
+                await websocket.close(code=1003, reason="Expected a binary JPEG frame")
+                return
+            if not encoded or len(encoded) > 8 * 1024 * 1024:
+                await websocket.send_json(_index_live_frame_update({
+                    "state": analyzer.state.value,
+                    "decision": {"result": "UNKNOWN", "reason": "invalid_or_oversized_frame"},
+                }, received_frame_index, legacy_frame_id))
+                continue
+            frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                await websocket.send_json(_index_live_frame_update({
+                    "state": analyzer.state.value,
+                    "decision": {"result": "UNKNOWN", "reason": "frame_decode_failed"},
+                }, received_frame_index, legacy_frame_id))
+                continue
+            update = await asyncio.to_thread(analyzer.process_frame, frame)
+            await websocket.send_json(_index_live_frame_update(update, received_frame_index, legacy_frame_id))
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        # Keep protocol and server failures diagnosable by clients while avoiding
+        # exposing internal exception details over the public WebSocket.
+        logger.exception("Live WebSocket frame processing failed")
+        try:
+            await websocket.close(code=1011, reason="Live frame processing failed")
+        except RuntimeError:
+            pass
+
+
 @app.post("/debug-video")
 async def debug_video(video: UploadFile = File(...)):
     """
@@ -1427,8 +1246,7 @@ async def debug_video(video: UploadFile = File(...)):
         safe_filename = os.path.basename(video.filename or "video.mp4")
         input_path = f"/tmp/{file_id}_{safe_filename}"
 
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
+        await save_video_upload(video, input_path)
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -1450,7 +1268,7 @@ async def debug_video(video: UploadFile = File(...)):
 
         court_analysis = detect_court(first_frame)
         court_corners = get_court_corners(first_frame)
-        court_region, court_region_mode = build_court_region(first_frame, court_corners)
+        court_region, court_region_mode = build_court_region(first_frame, court_corners, court_analysis.get("lines"))
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -1478,9 +1296,13 @@ async def debug_video(video: UploadFile = File(...)):
         trajectory, tracking_confidence = track_shuttle(
             frame_candidates_by_frame
         )
+        shuttle_detected = (
+            len(trajectory) >= 3
+            and float(tracking_confidence) >= 0.45
+        )
         landing_point = (
-            choose_landing_point(trajectory, fps, court_region, frame_size=first_frame.shape[:2])
-            if len(trajectory) >= 3
+            choose_landing_point(trajectory, fps, court_region)
+            if shuttle_detected
             else None
         )
         decision = check_landing_inside_court(
@@ -1544,6 +1366,9 @@ async def debug_video(video: UploadFile = File(...)):
             },
         )
 
+    except ValueError as e:
+        return JSONResponse(status_code=413 if "250 MB" in str(e) else 400,
+                            content={"status": "error", "message": str(e)})
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -1568,10 +1393,9 @@ async def analyze_video(video: UploadFile = File(...)):
     try:
         file_id = str(uuid.uuid4())
         safe_filename = os.path.basename(video.filename or "video.mp4")
-        input_path = f"/tmp/{file_id}_{safe_filename}"
+        input_path = os.path.join(tempfile.gettempdir(), f"{file_id}_{safe_filename}")
 
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
+        await save_video_upload(video, input_path)
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -1609,7 +1433,19 @@ async def analyze_video(video: UploadFile = File(...)):
         court_region, court_region_mode = build_court_region(
             first_frame,
             court_corners,
+            court_analysis.get("lines"),
         )
+        reliable_geometry = court_region_mode in ("geometry_polygon", "partial_geometry_polygon")
+        geometry_confidence = 0.72 if court_region_mode == "geometry_polygon" else (0.68 if reliable_geometry else 0.0)
+        geometry_diagnostics = {
+            "reliable": reliable_geometry,
+            "reason": ("partial_view_supported_by_two_line_families" if court_region_mode == "partial_geometry_polygon"
+                       else "validated_quadrilateral" if court_region_mode == "geometry_polygon"
+                       else "four supported boundary edges and an internal court marking were not established"),
+        }
+        if court_region_mode == "partial_geometry_polygon":
+            _, geometry_diagnostics = infer_court_region_from_lines(first_frame, court_analysis.get("lines", []))
+        court_analysis["court_detected"] = geometry_confidence > 0
 
         static_line_mask = build_static_line_mask(first_frame, court_analysis)
 
@@ -1650,20 +1486,40 @@ async def analyze_video(video: UploadFile = File(...)):
             frame_candidates_by_frame
         )
 
-        # Three points are the minimum for a meaningful trajectory estimate.
-        shuttle_detected = len(trajectory) >= 3
+        # Three points are the minimum for a trajectory, but a trajectory
+        # alone is not enough for a public IN/OUT call. Require meaningful
+        # tracker confidence so persistent bright objects cannot become a
+        # false shuttle.
+        shuttle_detected = (
+            len(trajectory) >= 3
+            and float(tracking_confidence) >= 0.45
+        )
 
         estimated_landing_point = (
-            choose_landing_point(trajectory, fps, court_region, frame_size=first_frame.shape[:2])
+            choose_landing_point(trajectory, fps, court_region)
             if shuttle_detected
             else None
         )
 
-        if court_region_mode == "geometry_polygon":
+        if reliable_geometry:
             landing_decision = check_landing_inside_court(
                 estimated_landing_point,
                 court_region,
+                margin=max(10.0, math.hypot(width, height) * 0.008),
             )
+            # Only a clearly observed contact reversal plus a strong track can
+            # support a line call. A terminal image point or weak track stays
+            # UNKNOWN even when its coordinate falls inside the polygon.
+            if (landing_decision.get("result") != "UNKNOWN"
+                    and (tracking_confidence < 0.65
+                         or not estimated_landing_point
+                         or estimated_landing_point.get("method") != "downward_phase_bounce")):
+                landing_decision = {
+                    "result": "UNKNOWN",
+                    "inside": None,
+                    "boundary_distance_pixels": landing_decision.get("boundary_distance_pixels"),
+                    "reason": "Strong track and observed contact reversal are required",
+                }
         else:
             landing_decision = {
                 "result": "UNKNOWN",
@@ -1682,11 +1538,11 @@ async def analyze_video(video: UploadFile = File(...)):
             else 0.0
         )
 
-        overall_confidence = tracking_confidence
+        overall_confidence = min(float(tracking_confidence), float(geometry_confidence))
 
         elapsed = round(time.time() - started, 2)
 
-        return {
+        payload = {
             "status": "success",
             "message": "Video analyzed successfully",
             "processing_seconds": elapsed,
@@ -1712,18 +1568,22 @@ async def analyze_video(video: UploadFile = File(...)):
                 "court_lines_detected": int(
                     court_analysis.get("court_lines_detected", 0)
                 ),
+                "lines": court_analysis.get("lines", []),
+                "intersections": court_analysis.get("intersections", []),
                 "corners": court_corners,
                 "playable_region": court_region,
                 "region_mode": court_region_mode,
+                "geometry_confidence": geometry_confidence,
+                "diagnostics": geometry_diagnostics,
                 "setup": {
                     "status": (
                         "READY"
-                        if court_region_mode == "geometry_polygon"
+                        if reliable_geometry
                         else "REPOSITION_PHONE"
                     ),
                     "instruction": (
                         "Court geometry detected. Keep the phone steady."
-                        if court_region_mode == "geometry_polygon"
+                        if reliable_geometry
                         else
                         "Move the phone until multiple court boundary lines "
                         "and the court corners are clearly visible."
@@ -1739,6 +1599,14 @@ async def analyze_video(video: UploadFile = File(...)):
                 "tracking_confidence": round(
                     float(tracking_confidence), 3
                 ),
+                "selected_track_score": round(float(tracking_confidence), 3),
+                "rejection_reasons": ([] if shuttle_detected else [
+                    "no sufficiently long and moving candidate track"
+                ]),
+            },
+            "setup": {
+                "status": "READY" if reliable_geometry else "REPOSITION_PHONE",
+                "instruction": "Court geometry detected. Keep the phone steady." if reliable_geometry else "Move the phone until multiple court boundary lines and corners are clearly visible.",
             },
             "trajectory": trajectory[-30:],
             "estimated_landing_point": estimated_landing_point,
@@ -1747,7 +1615,27 @@ async def analyze_video(video: UploadFile = File(...)):
                 "confidence": round(float(overall_confidence), 3),
             },
         }
+        # Keep legacy top-level fields while also providing the mobile app's
+        # expected data.decision.result envelope.
+        payload["court_detection"] = payload["court_analysis"]
+        payload["data"] = {
+            "status": payload["status"],
+            "message": payload["message"],
+            "processing_seconds": payload["processing_seconds"],
+            "video_info": payload["video_info"],
+            "motion_analysis": payload["motion_analysis"],
+            "court_detection": payload["court_detection"],
+            "setup": payload["court_detection"]["setup"],
+            "shuttle_detection": payload["shuttle_detection"],
+            "trajectory": payload["trajectory"],
+            "estimated_landing_point": payload["estimated_landing_point"],
+            "decision": payload["decision"],
+        }
+        return payload
 
+    except ValueError as e:
+        return JSONResponse(status_code=413 if "250 MB" in str(e) else 400,
+                            content={"status": "error", "message": str(e)})
     except Exception as e:
         return JSONResponse(
             status_code=500,

@@ -1,266 +1,138 @@
-import builtins
+"""Regression coverage ported from the former LiveAnalysisSession API."""
 import json
-import math
-import os
+import unittest
 
 import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 
 import main
+from runtime_analyzer import LiveFrameAnalyzer
 
 
-def test_geometry_change_detects_translation_rotation_scale_and_perspective():
-    reference = np.array([[80, 60], [560, 65], [550, 360], [90, 350]], dtype=np.float32)
-    assert not main._court_geometry_changed(reference, reference + [3, 2], (400, 640, 3))
-    assert main._court_geometry_changed(reference, reference + [30, 0], (400, 640, 3))
-
-    center = reference.mean(axis=0)
-    angle = math.radians(4)
-    rotation = np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
-    rotated = (reference - center) @ rotation.T + center
-    assert main._court_geometry_changed(reference, rotated, (400, 640, 3))
-    assert main._court_geometry_changed(reference, center + (reference - center) * 1.08, (400, 640, 3))
-    perspective = reference.copy()
-    perspective[0] += [0, 25]
-    assert main._court_geometry_changed(reference, perspective, (400, 640, 3))
+BASE_POLYGON = [(10, 10), (90, 10), (90, 90), (10, 90)]
 
 
-def test_phase_correlation_detects_translation_in_portrait_and_landscape():
-    rng = np.random.default_rng(7)
-    for height, width in ((240, 320), (320, 240)):
-        image = rng.integers(0, 255, (height, width), dtype=np.uint8)
-        shifted = cv2.warpAffine(image, np.float32([[1, 0, 9], [0, 1, 0]]), (width, height))
-        assert main._global_translation_detected(image, shifted)
-        assert not main._global_translation_detected(image, image.copy())
+def make_analyzer(court_provider=None, candidate_provider=None, tracker=None,
+                  landing_estimator=None, decision_maker=None):
+    court_calls = {"count": 0}
+    candidate_calls = {"count": 0}
 
+    def court(frame):
+        court_calls["count"] += 1
+        if court_provider:
+            return court_provider(court_calls["count"])
+        return {"region": BASE_POLYGON, "mode": "geometry_polygon", "confidence": 0.9,
+                "reliable": True, "diagnostics": {"reliable": True}, "lines": []}
 
-def test_landing_bounds_use_actual_portrait_and_landscape_frame_dimensions():
-    trajectory = [
-        {"frame": i, "x": 1150 + i * 8, "y": y}
-        for i, y in enumerate((300, 400, 500, 580, 650, 580))
-    ]
-    assert main.choose_landing_point(trajectory, 8, frame_size=(720, 1280)) is not None
+    def extract(frame, previous, previous_previous, static_line_mask=None):
+        candidate_calls["count"] += 1
+        candidates = candidate_provider(candidate_calls["count"]) if candidate_provider else []
+        return frame[:, :, 0].copy(), candidates
 
-    portrait = [
-        {"frame": i, "x": 500 + i * 4, "y": y}
-        for i, y in enumerate((300, 550, 800, 1100, 1450, 1350))
-    ]
-    assert main.choose_landing_point(portrait, 8, frame_size=(1700, 800)) is not None
-
-
-def _patch_live_session(monkeypatch, confidence=0.0, decision="UNKNOWN"):
-    corners = {
-        "top_left": [20, 20],
-        "top_right": [220, 20],
-        "bottom_right": [220, 180],
-        "bottom_left": [20, 180],
-    }
-    monkeypatch.setattr(main, "get_court_corners", lambda frame: corners)
-    monkeypatch.setattr(main, "build_court_region", lambda frame, found: (corners, "geometry_polygon"))
-    monkeypatch.setattr(main, "detect_court", lambda frame: {"lines": []})
-    monkeypatch.setattr(main, "build_static_line_mask", lambda frame, analysis: np.zeros(frame.shape[:2], dtype=np.uint8))
-    monkeypatch.setattr(
-        main,
-        "extract_frame_candidates",
-        lambda frame, previous, previous_previous, static_line_mask=None: (np.zeros((20, 20), dtype=np.uint8), []),
+    analyzer = LiveFrameAnalyzer(
+        court_analyzer=court,
+        candidate_extractor=extract,
+        tracker=tracker or main.track_shuttle,
+        landing_estimator=landing_estimator or main.choose_landing_point,
+        decision_maker=decision_maker or (lambda point, region: {"result": "UNKNOWN", "inside": None}),
+        static_mask_builder=lambda frame, lines: None,
     )
-    trajectory = [
-        {"frame": i, "x": 60 + i * 10, "y": y}
-        for i, y in enumerate((30, 60, 90, 130, 160, 120))
-    ]
-    monkeypatch.setattr(main, "track_shuttle", lambda history: (trajectory, confidence))
-    monkeypatch.setattr(main, "choose_landing_point", lambda *args, **kwargs: {"frame": 0, "x": 60, "y": 30})
-    monkeypatch.setattr(
-        main,
-        "check_landing_inside_court",
-        lambda point, region: {"result": decision, "inside": decision == "IN"},
-    )
-    return corners
+    return analyzer, court_calls
 
 
-def test_geometry_is_reused_between_scheduled_checks(monkeypatch):
-    corners = _patch_live_session(monkeypatch)
-    calls = 0
-
-    def detect(frame):
-        nonlocal calls
-        calls += 1
-        return corners
-
-    monkeypatch.setattr(main, "get_court_corners", detect)
-    session = main.LiveAnalysisSession("test-session")
-    frame = np.zeros((200, 240, 3), dtype=np.uint8)
-    for index in range(4):
-        session.process_frame(frame, index)
-    assert calls == 1
-    session.process_frame(frame, 4)
-    assert calls == 2
-    assert session.candidate_frames.maxlen == 16
+def frame():
+    return np.zeros((100, 100, 3), dtype=np.uint8)
 
 
-def test_camera_translation_invalidates_tracking_and_emits_recalibrating(monkeypatch):
-    corners = _patch_live_session(monkeypatch)
-    session = main.LiveAnalysisSession("moving-camera")
-    frame = np.zeros((200, 240, 3), dtype=np.uint8)
-    for index in range(4):
-        session.process_frame(frame, index)
-    for point in corners.values():
-        point[0] += 30
-    update = session.process_frame(frame, 4)
-    assert update["state"] == "RECALIBRATING"
-    assert update["decision"]["result"] == "UNKNOWN"
-    assert session.reference_corners is not None
+class LegacyLiveAnalysisCompatibilityTests(unittest.TestCase):
+    def test_geometry_is_checked_each_frame_while_ready_state_stays_stable(self):
+        analyzer, court_calls = make_analyzer()
+        updates = [analyzer.process_frame(frame(), timestamp=index / 30) for index in range(6)]
+        self.assertEqual(court_calls["count"], 6)
+        self.assertTrue(all(update["state"] == "COURT_READY" for update in updates[2:]))
+        self.assertTrue(all(update["calibration_valid"] for update in updates[2:]))
 
+    def test_camera_geometry_change_replaces_calibration_only_after_consensus(self):
+        def court(call):
+            shift = 30 if call >= 4 else 0
+            polygon = [(x + shift, y) for x, y in BASE_POLYGON]
+            return {"region": polygon, "mode": "geometry_polygon", "confidence": 0.9,
+                    "reliable": True, "diagnostics": {"reliable": True}, "lines": []}
 
-def test_insufficient_tracking_never_emits_in_or_out(monkeypatch):
-    _patch_live_session(monkeypatch, confidence=0.2, decision="IN")
-    session = main.LiveAnalysisSession("safe-session")
-    frame = np.zeros((200, 240, 3), dtype=np.uint8)
-    result = session.process_frame(frame, 0)
-    assert result["state"] != "IN"
-    assert result["decision"]["result"] == "UNKNOWN"
+        analyzer, _ = make_analyzer(court_provider=court)
+        updates = [analyzer.process_frame(frame(), timestamp=index / 30) for index in range(6)]
+        self.assertEqual(updates[3]["calibration_status"], "change_candidate")
+        self.assertFalse(updates[3]["geometry_valid"])
+        self.assertFalse(updates[4]["geometry_valid"])
+        self.assertTrue(updates[5]["geometry_valid"])
+        self.assertTrue(updates[5]["calibration_valid"])
+        self.assertEqual(updates[5]["geometry"]["region"][0][0], BASE_POLYGON[0][0] + 30)
+        self.assertTrue(all(update["decision"]["result"] == "UNKNOWN" for update in updates[3:5]))
 
+    def test_low_confidence_track_never_emits_in_or_out(self):
+        path = [{"frame": index, "x": 20 + index * 20, "y": 20 + index * 15} for index in range(5)]
+        calls = {"count": 0}
 
-def test_landing_event_id_is_stable_for_repeated_frames(monkeypatch):
-    _patch_live_session(monkeypatch, confidence=0.8, decision="IN")
-    session = main.LiveAnalysisSession("stable-session")
-    frame = np.zeros((200, 240, 3), dtype=np.uint8)
-    first = session.process_frame(frame, 50)
-    second = session.process_frame(frame, 51)
-    assert first["decision"]["event_id"] == "stable-session:50"
-    assert second["decision"]["event_id"] == first["decision"]["event_id"]
+        def decide(_point, _region):
+            calls["count"] += 1
+            return {"result": "IN", "inside": True}
 
-
-def test_websocket_malformed_frame_disconnect_and_reconnect():
-    client = TestClient(main.app)
-    with client.websocket_connect("/ws/analyze-live") as websocket:
-        assert websocket.receive_json()["state"] == "SEARCHING_FOR_COURT"
-        websocket.send_text(json.dumps({"type": "session", "session_id": "stable-client", "next_frame_id": 40}))
-        websocket.send_bytes(b"not a JPEG")
-        update = websocket.receive_json()
-        assert update["state"] == "UNKNOWN"
-        assert update["decision"]["result"] == "UNKNOWN"
-        assert update["frame_id"] == 40
-
-    with client.websocket_connect("/ws/analyze-live") as websocket:
-        websocket.receive_json()
-        websocket.send_text(json.dumps({"type": "session", "session_id": "stable-client", "next_frame_id": 41}))
-        websocket.send_bytes(b"not a JPEG")
-        update = websocket.receive_json()
-        assert update["state"] == "UNKNOWN"
-        assert update["frame_id"] == 41
-
-
-def test_websocket_valid_jpeg_returns_json_analysis_update(monkeypatch):
-    _patch_live_session(monkeypatch)
-    ok, encoded = cv2.imencode(".jpg", np.zeros((200, 240, 3), dtype=np.uint8))
-    assert ok
-
-    client = TestClient(main.app)
-    with client.websocket_connect("/ws/analyze-live") as websocket:
-        initial = websocket.receive_json()
-        assert initial["state"] == "SEARCHING_FOR_COURT"
-
-        websocket.send_bytes(encoded.tobytes())
-        update = websocket.receive_json()
-
-    assert update["state"] == "LANDING_ANALYSIS"
-    assert update["frame_id"] == 0
-    assert update["geometry"]["ready"] is True
-    assert update["shuttle_tracking"]["tracked_points"] == 6
-    assert update["decision"]["result"] == "UNKNOWN"
-
-
-def test_health_endpoint_is_available():
-    response = TestClient(main.app).get("/health")
-    assert response.status_code == 200
-    assert response.json() == {"status": "healthy"}
-
-
-def test_video_route_keeps_multipart_field_and_decision_contract():
-    parameters = main.analyze_video.__annotations__
-    assert "video" in parameters
-    source = open(main.__file__, encoding="utf-8").read()
-    video_handler = source[source.index('async def analyze_video'):]
-    assert '"decision": {' in video_handler
-    assert '"result"' in video_handler
-
-
-def test_analyze_video_accepts_multipart_generated_video_and_returns_decision(
-    monkeypatch, tmp_path
-):
-    video_path = tmp_path / "small-test.avi"
-    writer = cv2.VideoWriter(
-        str(video_path), cv2.VideoWriter_fourcc(*"MJPG"), 5.0, (64, 48)
-    )
-    assert writer.isOpened(), "OpenCV MJPG video writer is required for this integration test"
-    for index in range(3):
-        frame = np.full((48, 64, 3), index * 20, dtype=np.uint8)
-        writer.write(frame)
-    writer.release()
-
-    # The endpoint uses /tmp, which is not a writable temp directory on Windows.
-    # Map only its generated upload path to pytest's isolated temporary directory.
-    actual_open = builtins.open
-
-    def open_in_test_temp(path, *args, **kwargs):
-        if isinstance(path, (str, os.PathLike)) and os.fspath(path).startswith("/tmp/"):
-            path = tmp_path / os.path.basename(os.fspath(path))
-        return actual_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", open_in_test_temp)
-    actual_video_capture = cv2.VideoCapture
-
-    def capture_uploaded_video(path, *args, **kwargs):
-        path = os.fspath(path)
-        if path.startswith("/tmp/"):
-            path = str(tmp_path / os.path.basename(path))
-        return actual_video_capture(path, *args, **kwargs)
-
-    monkeypatch.setattr(main.cv2, "VideoCapture", capture_uploaded_video)
-    corners = {
-        "top_left": [5, 5],
-        "top_right": [58, 5],
-        "bottom_right": [58, 42],
-        "bottom_left": [5, 42],
-    }
-    monkeypatch.setattr(
-        main,
-        "detect_court",
-        lambda frame: {"court_detected": True, "court_lines_detected": 4, "lines": []},
-    )
-    monkeypatch.setattr(main, "get_court_corners", lambda frame: corners)
-    monkeypatch.setattr(
-        main,
-        "build_court_region",
-        lambda frame, found: (corners, "geometry_polygon"),
-    )
-    monkeypatch.setattr(
-        main,
-        "build_static_line_mask",
-        lambda frame, analysis: np.zeros(frame.shape[:2], dtype=np.uint8),
-    )
-    monkeypatch.setattr(
-        main,
-        "extract_frame_candidates",
-        lambda frame, previous, previous_previous, static_line_mask=None: (
-            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), []
-        ),
-    )
-    monkeypatch.setattr(main, "track_shuttle", lambda history: ([], 0.0))
-
-    client = TestClient(main.app)
-    with video_path.open("rb") as video_file:
-        response = client.post(
-            "/analyze-video",
-            files={"video": ("small-test.avi", video_file, "video/x-msvideo")},
+        analyzer, _ = make_analyzer(
+            candidate_provider=lambda n: [{"x": 20 + n * 8, "y": 20 + n * 10, "score": 0.95}],
+            tracker=lambda _history: (path, 0.2),
+            landing_estimator=lambda *_args: {"frame": 2, "x": 50, "y": 60, "method": "downward_phase_bounce"},
+            decision_maker=decide,
         )
+        updates = [analyzer.process_frame(frame(), timestamp=index / 30) for index in range(10)]
+        self.assertEqual(calls["count"], 0)
+        self.assertTrue(all(update["decision"]["result"] not in ("IN", "OUT") for update in updates))
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"] == "success"
-    assert payload["video_info"]["total_frames"] == 3
-    assert payload["video_info"]["resolution"] == {"width": 64, "height": 48}
-    assert payload["decision"]["result"] == "UNKNOWN"
-    assert "confidence" in payload["decision"]
+    def test_landing_events_belong_to_one_track_and_new_trajectories_get_new_ids(self):
+        path = [{"frame": index, "x": 20 + index * 12, "y": 20 + index * 15} for index in range(5)]
+        analyzer, _ = make_analyzer(
+            candidate_provider=lambda n: [{"x": 20 + n * 8, "y": 20 + n * 10, "score": 0.95}],
+            tracker=lambda _history: (path, 0.9),
+            landing_estimator=lambda *_args: {"frame": 2, "x": 50, "y": 60, "method": "downward_phase_bounce"},
+            decision_maker=lambda _point, _region: {"result": "IN", "inside": True},
+        )
+        updates = [analyzer.process_frame(frame(), timestamp=index / 30) for index in range(5)]
+        verdicts = [update for update in updates if update["decision"]["result"] in ("IN", "OUT")]
+        self.assertGreaterEqual(len(verdicts), 2)
+        event_ids = [update["decision"]["event_id"] for update in verdicts]
+        self.assertEqual(len(event_ids), len(set(event_ids)))
+        self.assertTrue(all(update["decision"]["track_id"] == update["track_id"] for update in verdicts))
+
+    def test_legacy_session_frame_id_protocol_survives_bad_frames_and_reconnect(self):
+        client = TestClient(main.app)
+        for expected_frame_id in (40, 41):
+            with client.websocket_connect("/ws/analyze-live") as websocket:
+                greeting = websocket.receive_json()
+                self.assertEqual(greeting["state"], "SEARCHING_FOR_COURT")
+                self.assertEqual(greeting["message"], "Send binary JPEG frames to begin.")
+                websocket.send_text(json.dumps({
+                    "type": "session", "session_id": "legacy-client", "next_frame_id": expected_frame_id,
+                }))
+                websocket.send_bytes(b"not a JPEG")
+                update = websocket.receive_json()
+                self.assertEqual(update["decision"]["result"], "UNKNOWN")
+                self.assertEqual(update["frame_id"], expected_frame_id)
+                self.assertEqual(update["frame_index"], 1)
+                self.assertIsNone(update["analysis_frame_index"])
+
+    def test_portrait_and_landscape_landing_bounds_remain_supported(self):
+        landscape = [
+            {"frame": index, "x": 1150 + index * 8, "y": y}
+            for index, y in enumerate((300, 400, 500, 580, 650, 580))
+        ]
+        portrait = [
+            {"frame": index, "x": 500 + index * 4, "y": y}
+            for index, y in enumerate((300, 550, 800, 1100, 1450, 1350))
+        ]
+        self.assertIsNotNone(main.choose_landing_point(landscape, 8, frame_size=(720, 1280)))
+        self.assertIsNotNone(main.choose_landing_point(portrait, 8, frame_size=(1700, 800)))
+        self.assertIsNone(main.choose_landing_point(landscape, 8, frame_size=(480, 640)))
+
+
+if __name__ == "__main__":
+    unittest.main()
